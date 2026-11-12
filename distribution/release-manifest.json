@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.0",
+  "baseUrl": "https://github.com/rycan-top/field-trace-graph/releases/download/v0.1.0",
+  "platforms": [
+    {
+      "os": "darwin",
+      "cpu": "arm64",
+      "archive": "field-trace-graph-0.1.0-darwin-arm64.tar.gz",
+      "sha256": "c58cb2c1b956013a4f33be9b0ed7b85ff48f6fa607bb12b06b528a0dc09b2c71"
+    },
+    {
+      "os": "darwin",
+      "cpu": "x64",
+      "archive": "field-trace-graph-0.1.0-darwin-x64.tar.gz",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "os": "linux",
+      "cpu": "x64",
+      "archive": "field-trace-graph-0.1.0-linux-x64.tar.gz",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "os": "win32",
+      "cpu": "x64",
+      "archive": "field-trace-graph-0.1.0-win32-x64.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

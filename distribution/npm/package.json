@@ -1,0 +1,38 @@
+{
+  "name": "field-trace-graph",
+  "version": "0.1.0",
+  "description": "Local Java field-lineage CLI installer (thin launcher)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rycan-top/field-trace-graph.git"
+  },
+  "homepage": "https://github.com/rycan-top/field-trace-graph",
+  "bugs": {
+    "url": "https://github.com/rycan-top/field-trace-graph/issues"
+  },
+  "bin": {
+    "field-trace-graph": "bin/field-trace-graph.js",
+    "ftg": "bin/field-trace-graph.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "release-manifest.json"
+  ],
+  "scripts": {
+    "prepack": "node scripts/sync-manifest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 作用：core 模块的构建定义，刻意不声明第三方依赖。 -->
+<!-- 使用场景：验证内核无框架依赖；新增依赖前需确认架构约束。 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.fieldtracegraph</groupId>
+        <artifactId>field-trace-graph-parent</artifactId>
+        <version>0.1.0</version>
+    </parent>
+
+    <artifactId>lineage-core</artifactId>
+    <name>lineage-core</name>
+    <description>Domain model, query rules, ports, and shared JDK-only utilities</description>
+
+    <dependencies>
+        <!-- Intentionally empty: core must not depend on Spring, SQL, JavaParser, or JSON. -->
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

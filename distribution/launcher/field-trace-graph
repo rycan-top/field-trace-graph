@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# 作用：归档内的 Unix 启动脚本。
+# 使用场景：解压发布包后直接运行 ftg。
+set -e
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+JAR="$SCRIPT_DIR/../lib/field-trace-graph.jar"
+JAVA="$SCRIPT_DIR/../runtime/bin/java"
+
+if [ ! -f "$JAR" ]; then
+    echo "field-trace-graph: missing $JAR" >&2
+    exit 1
+fi
+
+if [ ! -x "$JAVA" ]; then
+    JAVA=java
+fi
+
+exec "$JAVA" -jar "$JAR" "$@"

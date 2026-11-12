@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 作用：Java 分析模块的构建定义，依赖 core、JavaParser 与 Jackson。 -->
+<!-- 使用场景：升级解析器版本或增加分析相关依赖时。 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.fieldtracegraph</groupId>
+        <artifactId>field-trace-graph-parent</artifactId>
+        <version>0.1.0</version>
+    </parent>
+
+    <artifactId>lineage-java</artifactId>
+    <name>lineage-java</name>
+    <description>Java AST extraction, type and call resolution, and semantic analysis</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.fieldtracegraph</groupId>
+            <artifactId>lineage-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.github.javaparser</groupId>
+            <artifactId>javaparser-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

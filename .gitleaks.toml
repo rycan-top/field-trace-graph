@@ -1,0 +1,6 @@
+# Gitleaks configuration for field-trace-graph.
+# Uses the built-in rule set; project-specific allow-lists go under [allowlist].
+title = "field-trace-graph"
+
+[extend]
+useDefault = true

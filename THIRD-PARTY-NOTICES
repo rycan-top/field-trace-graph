@@ -1,0 +1,16 @@
+field-trace-graph uses the following third-party libraries.
+
+- picocli 4.7.6 (info.picocli:picocli) - Apache License 2.0
+- JavaParser 3.26.2 (com.github.javaparser:javaparser-core) - Apache License 2.0
+- SQLite JDBC 3.46.1.3 (org.xerial:sqlite-jdbc) - Apache License 2.0
+- Jackson Databind 2.17.2 (com.fasterxml.jackson.core:jackson-databind) - Apache License 2.0
+- Jackson Core 2.17.2 (com.fasterxml.jackson.core:jackson-core) - Apache License 2.0
+- Jackson Annotations 2.17.2 (com.fasterxml.jackson.core:jackson-annotations) - Apache License 2.0
+
+JavaParser declares a dual LGPL/Apache-2.0 license. This distribution uses the
+Apache License 2.0 option. Full dependency license and notice texts are under
+licenses/third-party in each release archive.
+
+The bundled runtime is the OpenJDK distribution selected at build time. Its
+module licenses and release metadata are under licenses/runtime-legal and
+licenses/runtime-release in each release archive.

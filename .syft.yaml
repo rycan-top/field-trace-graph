@@ -1,0 +1,7 @@
+# Syft configuration for release SBOM generation.
+# Generated build output and scan reports are excluded so the source SBOM
+# only describes the repository contents.
+exclude:
+  - "./distribution/build/**"
+  - "./**/target/**"
+  - "./security-reports/**"
