@@ -9,7 +9,7 @@
 - [x] `distribution/npm/package.json` 的 `license` 已改为 `Apache-2.0`，并补充 `repository` / `homepage` / `bugs`。
 - [x] `baseUrl` 已设为 `https://github.com/rycan-top/field-trace-graph/releases/download/v0.1.0`（发布 tag 必须是 `v0.1.0`）。
 - [ ] `darwin-x64`、`linux-x64`、`win32-x64` 三个平台的 `sha256` 仍为全 0 占位；目前只有 `darwin-arm64` 有真实哈希，需构建归档后回填。
-- [ ] 配置 cosign 签名（`COSIGN_PRIVATE_KEY`、`COSIGN_PASSWORD`），并为归档与清单生成 `.sig` 文件。
+- [ ] 配置 cosign 签名（`COSIGN_PRIVATE_KEY`、`COSIGN_PASSWORD`），并为归档与清单生成 `.sig` 文件。当前 workflow 不签名、门禁也不校验，发布产物实际为未签名状态。
 - [x] 已新增 `.github/workflows/release.yml`：4 平台矩阵构建 → 回填哈希 → 门禁 → GitHub Release → npm publish。
 - [ ] 需要在 GitHub 仓库配置 `NPM_TOKEN` secret，并推送 `v0.1.0` tag 触发发布。
 - [ ] 发布前确认 GitHub 仓库地址是 `rycan-top/field-trace-graph`，且 `baseUrl` 里的 tag 与实际 tag 一致。

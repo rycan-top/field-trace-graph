@@ -36,8 +36,9 @@ FTG_VERIFY_PLATFORM_ONLY=darwin-arm64 distribution/verify-release.sh
 ```
 
 The GitHub Actions `release` workflow builds all four target archives, merges
-their hashes into the manifest, runs the release gate, and signs the artifacts.
-The public HTTPS directory must be provided as the `base_url` workflow input.
+their hashes into the manifest, and runs the release gate. The download base URL
+comes from `baseUrl` in `distribution/release-manifest.json`; there is no
+`base_url` workflow input. Artifact signing is not automated yet (see Signing).
 
 ## npm And Smoke Tests
 
@@ -78,5 +79,7 @@ distribution/smoke-test-npm.sh \
 - [ ] Release archives and the manifest have detached `.sig` files.
 - [ ] Signatures are verified by a consumer before installation.
 
-The release workflow fails if the signing secret is absent; it does not publish
-unsigned artifacts.
+Not implemented yet: `release.yml` does not sign artifacts and
+`verify-release.sh` does not check signatures, so a release can be published
+unsigned. Until these items are implemented, treat published artifacts as
+unsigned and record that exception in the release notes.

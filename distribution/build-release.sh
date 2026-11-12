@@ -43,11 +43,29 @@ if [ "${FTG_STRICT_RELEASE:-0}" = "1" ] && [ "$BUNDLE_RUNTIME" != "1" ]; then
 fi
 
 cd "$ROOT"
+# Git Bash does not resolve executables without the .exe suffix for `test -x`,
+# and Windows JDKs ship javac.exe/java.exe only, so probe both names.
+jdk_tool() {
+  local bin="${1:-}" name="${2:-}"
+  [ -n "$bin" ] && [ -n "$name" ] || return 1
+  [ -x "$bin/$name" ] && { printf '%s' "$bin/$name"; return 0; }
+  [ -x "$bin/$name.exe" ] && { printf '%s' "$bin/$name.exe"; return 0; }
+  return 1
+}
+
 is_supported_jdk() {
   [ -n "${1:-}" ] || return 1
-  [ -x "$1/bin/javac" ] || return 1
-  "$1/bin/javac" -version 2>&1 | grep -Eq '^javac (17|21)(\.|$)'
+  local javac
+  javac="$(jdk_tool "$1/bin" javac)" || return 1
+  "$javac" -version 2>&1 | grep -Eq '^javac (17|21)(\.|$)'
 }
+
+# Git Bash passes Windows-style paths (C:\...) from the environment; convert
+# them so the POSIX file tests and tar/zip calls below see the expected paths.
+if command -v cygpath >/dev/null 2>&1; then
+  if [ -n "${FTG_JAVA_HOME:-}" ]; then FTG_JAVA_HOME="$(cygpath -u "$FTG_JAVA_HOME")"; fi
+  if [ -n "${FTG_RUNTIME_HOME:-}" ]; then FTG_RUNTIME_HOME="$(cygpath -u "$FTG_RUNTIME_HOME")"; fi
+fi
 
 JAVA_HOME="${FTG_JAVA_HOME:-}"
 if [ -n "$JAVA_HOME" ] && ! is_supported_jdk "$JAVA_HOME"; then
@@ -133,7 +151,7 @@ chmod +x "$STAGE/bin/field-trace-graph"
 chmod +x "$STAGE/bin/ftg"
 
 if [ "$BUNDLE_RUNTIME" = "1" ]; then
-  if [ -z "$RUNTIME_HOME" ] || [ ! -x "$RUNTIME_HOME/bin/java" ]; then
+  if [ -z "$RUNTIME_HOME" ] || ! jdk_tool "$RUNTIME_HOME/bin" java >/dev/null; then
     echo "A runtime is required; set FTG_RUNTIME_HOME or FTG_BUNDLE_RUNTIME=0." >&2
     exit 1
   fi
