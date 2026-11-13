@@ -201,7 +201,7 @@ import tempfile
 import zipfile
 
 archive = sys.argv[1]
-handle, temporary = tempfile.mkstemp(suffix=".zip")
+handle, temporary = tempfile.mkstemp(suffix=".zip", dir=os.path.dirname(archive))
 os.close(handle)
 with zipfile.ZipFile(archive) as source, zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as target:
     for info in source.infolist():
