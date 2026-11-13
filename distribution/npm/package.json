@@ -1,6 +1,6 @@
 {
   "name": "field-trace-graph",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local Java field-lineage CLI installer (thin launcher)",
   "license": "Apache-2.0",
   "repository": {
