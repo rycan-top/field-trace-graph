@@ -59,6 +59,7 @@ async function ensureRelease(manifest) {
   if (!fs.existsSync(archive)) {
     await download(manifest, entry, archive);
   }
+  process.stderr.write(`field-trace-graph: installing ${manifest.version}...\n`);
   install(archive, manifest.version, versionRoot);
   return versionRoot;
 }
