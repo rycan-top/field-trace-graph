@@ -681,9 +681,40 @@ public final class SourceTypeCatalog {
      */
     // 作用：查找虚调用的具体实现；逻辑：按直接子类型优先的广度遍历，收集有方法体的同名同参数方法。
     public List<MethodInfo> findConcreteOverrides(String typeQname, String methodName, int argumentCount) {
+        return findConcreteOverrides(typeQname, methodName, argumentCount, List.of(), false);
+    }
+
+    /**
+     * Resolves the concrete bodies that can receive a call declared on an
+     * interface or abstract class. Parameter types are compared after erasing
+     * generic arguments so {@code handle(Order)} still matches an implementation
+     * of {@code <T> handle(T)} while same-arity but incompatible overloads do
+     * not become false bridges.
+     */
+    // 作用：按声明签名查找具体实现；逻辑：同名同参数量之外再比对擦除后的参数类型，避免仅按参数个数误配。
+    public List<MethodInfo> findConcreteOverrides(
+            String typeQname,
+            String methodName,
+            int argumentCount,
+            List<String> declaredParameterTypes
+    ) {
+        return findConcreteOverrides(typeQname, methodName, argumentCount, declaredParameterTypes, true);
+    }
+
+    // 作用：查找具体实现重载；逻辑：广度优先遍历子类型，按参数类型是否兼容过滤。
+    private List<MethodInfo> findConcreteOverrides(
+            String typeQname,
+            String methodName,
+            int argumentCount,
+            List<String> declaredParameterTypes,
+            boolean matchTypes
+    ) {
         List<MethodInfo> result = new ArrayList<>();
         java.util.Set<String> visitedTypes = new java.util.HashSet<>();
         java.util.Set<String> visitedSymbols = new java.util.HashSet<>();
+        List<String> expectedTypes = matchTypes && declaredParameterTypes != null
+                ? declaredParameterTypes
+                : List.of();
         java.util.ArrayDeque<String> queue = new java.util.ArrayDeque<>(
                 directSubtypes.getOrDefault(typeQname, List.of())
         );
@@ -698,6 +729,8 @@ public final class SourceTypeCatalog {
                     if (method.hasBody()
                             && method.simpleName().equals(methodName)
                             && method.parameterTypes().size() == argumentCount
+                            && (expectedTypes.isEmpty()
+                            || parametersCompatible(expectedTypes, method.parameterTypes()))
                             && visitedSymbols.add(method.symbolId())) {
                         result.add(method);
                     }
@@ -706,6 +739,80 @@ public final class SourceTypeCatalog {
             queue.addAll(directSubtypes.getOrDefault(subtype, List.of()));
         }
         return result;
+    }
+
+    // 作用：判断声明参数与实现参数是否兼容；逻辑：逐项比较擦除泛型后的原始类型，类型变量位置接受任意具体类型。
+    private boolean parametersCompatible(List<String> declaredTypes, List<String> implementationTypes) {
+        if (declaredTypes.size() != implementationTypes.size()) {
+            return false;
+        }
+        for (int index = 0; index < declaredTypes.size(); index++) {
+            String declared = declaredTypes.get(index);
+            String implementation = implementationTypes.get(index);
+            if (sameErasedType(declared, implementation)
+                    || isTypeVariable(declared)
+                    || isTypeVariable(implementation)) {
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // 作用：按擦除后的原始类型比较；逻辑：全名精确相等，或一方为简单名时比较末段名称。
+    private boolean sameErasedType(String first, String second) {
+        String left = eraseType(first);
+        String right = eraseType(second);
+        if (left.equals(right)) {
+            return true;
+        }
+        boolean leftQualified = left.indexOf('.') >= 0;
+        boolean rightQualified = right.indexOf('.') >= 0;
+        if (leftQualified && rightQualified) {
+            return false;
+        }
+        return simpleTypeName(left).equals(simpleTypeName(right));
+    }
+
+    // 作用：取类型简单名；逻辑：去掉最后一个点号之前的内容与数组维度。
+    private String simpleTypeName(String type) {
+        String value = type == null ? "" : type.replace("[]", "");
+        int dot = value.lastIndexOf('.');
+        return dot < 0 ? value : value.substring(dot + 1);
+    }
+
+    // 作用：擦除类型实参；逻辑：移除非数组的尖括号内容，并去掉空白。
+    private String eraseType(String type) {
+        if (type == null) {
+            return "";
+        }
+        String value = type.replace(" ", "");
+        StringBuilder result = new StringBuilder(value.length());
+        int depth = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char current = value.charAt(index);
+            if (current == '<') {
+                depth++;
+                continue;
+            }
+            if (current == '>') {
+                depth = Math.max(0, depth - 1);
+                continue;
+            }
+            if (depth == 0) {
+                result.append(current);
+            }
+        }
+        return result.toString();
+    }
+
+    // 作用：判断类型名是否为单个大写类型变量；逻辑：长度为 1 且大写视为泛型类型变量。
+    private boolean isTypeVariable(String type) {
+        if (type == null) {
+            return false;
+        }
+        String value = type.trim();
+        return value.length() == 1 && Character.isUpperCase(value.charAt(0));
     }
 
     // 作用：在继承链中查找方法；逻辑：初始化访问集合后递归收集。

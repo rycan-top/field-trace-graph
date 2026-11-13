@@ -138,7 +138,7 @@ public final class JavaTypeNameResolver {
 
     /**
      * Strips generic arguments, arrays and varargs so a declaration such as
-     * {@code List<AgreementSignBO>} still yields a catalog type name.
+     * {@code List<OrderSummary>} still yields a catalog type name.
      */
     // 作用：规范化类型声明文本；逻辑：去掉泛型参数、数组维度与可变参数后缀，返回干净的类型名。
     public static String normalize(String typeName) {

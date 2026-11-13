@@ -33,3 +33,13 @@
 ## 4. 相关文件
 
 - [RELEASE-CHECKLIST.md](./RELEASE-CHECKLIST.md) — 发布门禁清单（原仓库根目录）。
+
+## 5. 字段桥与完整性语义（已完成）
+
+- [x] 虚调用 / RPC 服务接口调用按擦除参数类型匹配并桥接到**全部**源码实现；多实现产生 `CANDIDATE` 调用边，单实现保持 `VIRTUAL_UNIQUE`。
+- [x] 接口来自依赖 JAR、实现类在源码内时，也能按 `--classpath` 建立实现桥。
+- [x] 对象值 setter/getter 属性桥：`setXxx(request)` 后 `getXxx()` 返回的对象，其字段继续作为该对象的字段传播，不再生成 `holder.request.field`。
+- [x] `NO_USE` 拆分：`USE_UNRESOLVED`（有消费方但未桥接）、`CONSUMED_BY_CALL`（值被调用消费）、`NO_CONSUMER`（源码内确实没有消费方）。
+- [x] 完整性结论独立于边质量：相关弱跳、未桥接消费方、候选边与截断都会使 `completeness` 变为 `PARTIAL`；`quality` 仍只统计已发射的字段值边。
+- [x] text 输出展示全部 chains，弱跳不再截断到前 10 条；其余折叠项会显式打印剩余数量。
+- [x] `CONDITION_USES` 仍作为依赖证据保留，只在 `--include-dependencies` 时输出。

@@ -405,11 +405,13 @@ public final class LineageResultMerger {
             return List.of();
         }
         java.util.Set<String> visitedScopes = new java.util.LinkedHashSet<>();
+        java.util.Set<String> usefulNodeIds = new java.util.LinkedHashSet<>();
         java.util.Set<String> evidenceLocations = new java.util.LinkedHashSet<>();
         for (ValueRef ref : usefulRefs) {
             ValueNodeRecord node = index.node(ref.nodeId());
             if (node != null) {
                 visitedScopes.add(node.scopeSymbolId());
+                usefulNodeIds.add(node.valueId());
             }
         }
         for (var edge : usefulEdges) {
@@ -423,7 +425,32 @@ public final class LineageResultMerger {
                 .filter(hop -> hop.callerSymbolId() == null || visitedScopes.contains(hop.callerSymbolId()))
                 .filter(hop -> evidenceLocations.isEmpty()
                         || evidenceLocations.contains(hop.fileId() + ":" + hop.lineStart()))
+                .filter(hop -> touchesTracedValue(hop, usefulNodeIds))
                 .toList();
+    }
+
+    // 作用：判断弱跳是否接触被追踪值；逻辑：比较接收者、实参与结果节点，无值引用时保留方法级证据。
+    private boolean touchesTracedValue(TraceWeakHop hop, Set<String> usefulNodeIds) {
+        boolean hasValueReference = hop.receiverValueId() != null
+                || hop.resultValueId() != null
+                || (hop.argumentValueIds() != null && !hop.argumentValueIds().isEmpty());
+        if (!hasValueReference) {
+            return true;
+        }
+        if (hop.receiverValueId() != null && usefulNodeIds.contains(hop.receiverValueId())) {
+            return true;
+        }
+        if (hop.resultValueId() != null && usefulNodeIds.contains(hop.resultValueId())) {
+            return true;
+        }
+        if (hop.argumentValueIds() != null) {
+            for (String argumentValueId : hop.argumentValueIds()) {
+                if (argumentValueId != null && usefulNodeIds.contains(argumentValueId)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // 作用：把访问引用转为输出节点；逻辑：逐个调用索引转换并保持顺序。
@@ -454,6 +481,13 @@ public final class LineageResultMerger {
                 leaves.putIfAbsent(key + "|IN|" + reason, leaf);
             }
             if (includeOut && index.outgoing(ref).isEmpty()) {
+                if ("CALL_RESULT".equals(node.valueKind())
+                        && ref.fields().isEmpty()
+                        && index.isVoidCallResult(node.valueId())) {
+                    // A void call has no result value; its bookkeeping node is
+                    // not an unused field.
+                    continue;
+                }
                 if (!ref.fields().isEmpty()
                         && "PARAMETER".equals(node.valueKind())
                         && !index.hasFieldNode(node.scopeSymbolId(), node.canonicalValue(), ref.fields())) {
@@ -630,10 +664,34 @@ public final class LineageResultMerger {
                     "provide-generated-sources-or-classpath",
                     evidenceSource
             );
+            case "VIRTUAL_AMBIGUOUS" -> new BoundaryGuidance(
+                    "VIRTUAL_AMBIGUOUS",
+                    true,
+                    "provide-classpath-or-runtime-trace",
+                    evidenceSource
+            );
+            case "USE_UNRESOLVED" -> new BoundaryGuidance(
+                    "USE_UNRESOLVED",
+                    true,
+                    "resolve-call-target-or-provide-classpath",
+                    evidenceSource
+            );
+            case "CONSUMED_BY_CALL" -> new BoundaryGuidance(
+                    "CONSUMED_BY_CALL",
+                    false,
+                    "none",
+                    evidenceSource
+            );
+            case "NO_CONSUMER", "NO_USE" -> new BoundaryGuidance(
+                    "NO_CONSUMER",
+                    false,
+                    "none",
+                    evidenceSource
+            );
             default -> new BoundaryGuidance(
                     reason,
-                    "NO_USE".equals(reason) ? false : true,
-                    "NO_USE".equals(reason) ? "none" : "inspect-boundary-evidence",
+                    true,
+                    "inspect-boundary-evidence",
                     evidenceSource
             );
         };
@@ -791,7 +849,7 @@ public final class LineageResultMerger {
 
     /**
      * Preserves the exact source expression behind an edge. This is the
-     * evidence counterpart to PCA's edge expression and lets users audit a
+     * evidence counterpart to the graph contract's edge expression and lets users audit a
      * getter/setter call without promoting the call to a business field node.
      */
     // 作用：截取源码表达式片段；逻辑：按行列范围从文件内容读取。
@@ -829,7 +887,7 @@ public final class LineageResultMerger {
 
     /**
      * Groups evidence by the physical file that produced it. This is the CLI
-     * equivalent of PCA's {@code fileIndexes}, but keeps the snapshot hash so a
+     * equivalent of the graph contract's {@code fileIndexes}, but keeps the snapshot hash so a
      * consumer can tell which bytes were analysed.
      */
     // 作用：汇总文件级证据索引；逻辑：按文件分组边并生成索引项。
@@ -951,6 +1009,22 @@ public final class LineageResultMerger {
                 && !node.canonicalValue().startsWith("new:")) {
             return "EXTERNAL_BOUNDARY";
         }
+        if (!incoming && index.hasUnresolvedConsumer(ref)) {
+            /*
+             * The graph contains a consumer call site but no body to bridge
+             * into. This is a connectivity gap, not evidence that the field is
+             * unused in business code.
+             */
+            return "USE_UNRESOLVED";
+        }
+        if (!incoming && index.hasCallConsumer(ref)) {
+            /*
+             * The value is passed to a call whose result does not expose this
+             * field (typically a void method). The consumer exists, so the
+             * correct terminal state is "consumed by a call", not "unused".
+             */
+            return "CONSUMED_BY_CALL";
+        }
         if ("PARAMETER".equals(node.valueKind())) {
             return "PARAMETER";
         }
@@ -969,7 +1043,7 @@ public final class LineageResultMerger {
         if ("SQL_PARAMETER".equals(node.valueKind())) {
             return "SQL_PARAMETER";
         }
-        return incoming ? "NO_SOURCE" : "NO_USE";
+        return incoming ? "NO_SOURCE" : "NO_CONSUMER";
     }
 
     private record BoundaryProjection(List<TraceBoundary> boundaries, List<TraceLeaf> leaves) {

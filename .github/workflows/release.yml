@@ -16,9 +16,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (must match pom.xml and both manifests)"
+        description: "Version to publish (must match the root pom revision and manifests)"
         required: true
-        default: "0.1.0"
 
 permissions:
   contents: write
@@ -121,13 +120,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pom="$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' pom.xml | head -1)"
+          pom="$(sed -n 's:.*<revision>\(.*\)</revision>.*:\1:p' pom.xml | head -1)"
           manifest="$(node -p 'require("./distribution/release-manifest.json").version')"
           pkg="$(node -p 'require("./distribution/npm/package.json").version')"
           echo "pom=$pom manifest=$manifest npm=$pkg tag=$RELEASE_VERSION"
-          [ "$pom" = "$RELEASE_VERSION" ] || { echo "pom.xml version mismatch" >&2; exit 1; }
+          [ "$pom" = "$RELEASE_VERSION" ] || { echo "pom.xml revision mismatch" >&2; exit 1; }
           [ "$manifest" = "$RELEASE_VERSION" ] || { echo "release-manifest version mismatch" >&2; exit 1; }
           [ "$pkg" = "$RELEASE_VERSION" ] || { echo "npm package version mismatch" >&2; exit 1; }
+          for module in lineage-core lineage-java lineage-storage-sqlite lineage-cli; do
+            grep -q '<version>\${revision}</version>' "$module/pom.xml" \
+              || { echo "$module does not inherit \${revision}" >&2; exit 1; }
+          done
+          node - "$RELEASE_VERSION" <<'NODE'
+          const m = require("./distribution/release-manifest.json");
+          for (const p of m.platforms) {
+            const extension = p.os === "win32" ? "zip" : "tar.gz";
+            const expected = `field-trace-graph-${process.argv[2]}-${p.os}-${p.cpu}.${extension}`;
+            if (p.archive !== expected) {
+              console.error(`${p.os}-${p.cpu}: archive=${p.archive}, expected ${expected}`);
+              process.exit(1);
+            }
+          }
+          NODE
 
       - name: Download archives
         uses: actions/download-artifact@v4
@@ -146,10 +160,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node -e '
-          const m = require("./distribution/release-manifest.json");
-          for (const p of m.platforms) console.log(`${p.os} ${p.cpu} ${p.archive}`);
-          ' | while read -r os cpu archive; do
+          # Archive names are derived from the release version, not read back
+          # from the manifest. That keeps the four manifest entries generated
+          # instead of hand-edited before every release.
+          platforms=(
+            "darwin arm64 tar.gz"
+            "darwin x64 tar.gz"
+            "linux x64 tar.gz"
+            "win32 x64 zip"
+          )
+          for platform in "${platforms[@]}"; do
+            read -r os cpu extension <<< "$platform"
+            archive="field-trace-graph-${RELEASE_VERSION}-${os}-${cpu}.${extension}"
             if [ ! -f "distribution/build/$archive" ]; then
               echo "missing archive: $archive" >&2
               exit 1

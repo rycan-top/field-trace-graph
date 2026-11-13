@@ -143,7 +143,7 @@ public final class CallSiteExtractor {
         }
     }
 
-    // 作用：记录普通调用；逻辑：生成调用边并保留接收者、参数与结果值，候选或未解析时写待解析引用。
+    // 作用：记录普通调用；逻辑：多实现虚调用逐目标建边，随后按需写待解析引用以保留歧义证据。
     private void addCall(
             SourceFileRecord source,
             CallableScope scope,
@@ -159,28 +159,39 @@ public final class CallSiteExtractor {
         CallResolution effective = exactStaticResolution(resolution, dispatchKind);
         int line = call.getBegin().map(position -> position.line).orElse(1);
         int column = call.getBegin().map(position -> position.column).orElse(1);
-        String callSiteId = Ids.sha256(scope.symbolId(), effective.targetQname(), String.valueOf(line));
-        String edgeId = Ids.sha256(scope.symbolId(), effective.targetQname(), call.toString(), String.valueOf(sequence));
         List<String> argumentValueIds = argumentValueIds(call, nodes, context);
         String resultValueId = resultValueId(call, nodes, context);
-        accumulator.addCallEdge(new CallEdgeRecord(
-                edgeId,
-                callSiteId,
-                scope.symbolId(),
-                effective.calleeSymbolId(),
-                effective.targetQname(),
-                dispatchKind,
-                effective.resolution(),
-                receiverValueId,
-                argumentValueIds,
-                resultValueId,
-                source.fileId(),
-                line,
-                column,
-                call.getEnd().map(position -> position.line).orElse(1),
-                call.getEnd().map(position -> position.column).orElse(1)
-        ));
-        if ("CANDIDATE".equals(effective.resolution()) || "UNRESOLVED".equals(effective.resolution())) {
+        for (CallResolution target : expandConcreteTargets(effective)) {
+            String callSiteId = Ids.sha256(
+                    scope.symbolId(), target.targetQname(), String.valueOf(line)
+            );
+            String edgeId = Ids.sha256(
+                    scope.symbolId(), target.targetQname(), call.toString(), String.valueOf(sequence)
+            );
+            accumulator.addCallEdge(new CallEdgeRecord(
+                    edgeId,
+                    callSiteId,
+                    scope.symbolId(),
+                    target.calleeSymbolId(),
+                    target.targetQname(),
+                    dispatchKind,
+                    target.resolution(),
+                    receiverValueId,
+                    argumentValueIds,
+                    resultValueId,
+                    source.fileId(),
+                    line,
+                    column,
+                    call.getEnd().map(position -> position.line).orElse(1),
+                    call.getEnd().map(position -> position.column).orElse(1)
+            ));
+        }
+        if (effective.hasConcreteTargets()
+                || "CANDIDATE".equals(effective.resolution())
+                || "UNRESOLVED".equals(effective.resolution())) {
+            String callSiteId = Ids.sha256(
+                    scope.symbolId(), effective.targetQname(), String.valueOf(line)
+            );
             accumulator.addPendingRef(new PendingRefRecord(
                     Ids.sha256(scope.symbolId(), "pending", effective.targetQname(), call.toString(), String.valueOf(sequence)),
                     callSiteId,
@@ -200,6 +211,25 @@ public final class CallSiteExtractor {
                     resultValueId
             ));
         }
+    }
+
+    /**
+     * A virtual call with several source implementations is one physical call
+     * site whose runtime receiver can be any implementation. Emit one
+     * candidate edge per implementation so argument/return bridges connect to
+     * every analysed body instead of stopping at the abstract declaration.
+     */
+    // 作用：展开多实现虚调用；逻辑：单目标原样返回，多目标转成逐实现的候选解析结果。
+    private List<CallResolution> expandConcreteTargets(CallResolution resolution) {
+        if (!resolution.hasConcreteTargets()) {
+            return List.of(resolution);
+        }
+        return resolution.targets().stream()
+                .map(target -> CallResolution.candidateTarget(
+                        target.symbolId(),
+                        target.qname()
+                ))
+                .toList();
     }
 
     // 作用：提升编译期确定调用；逻辑：静态分派或构造器的编译期目标升级为精确静态，其余保持原级别。

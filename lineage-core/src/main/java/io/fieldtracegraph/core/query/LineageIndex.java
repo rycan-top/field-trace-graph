@@ -38,16 +38,21 @@ final class LineageIndex {
     private final Map<String, List<Step>> outgoingByNode = new HashMap<>();
     private final Map<String, List<FieldExpansion>> fieldExpansionsByNode = new HashMap<>();
     private final Set<String> fieldNodeIdsWithEvidence = new HashSet<>();
+    private final Set<String> objectValuedFieldIds = new HashSet<>();
+    private final Set<String> objectValuedFieldPaths = new HashSet<>();
     private final Map<String, Step> stepByEvidenceId = new HashMap<>();
     private final Map<String, List<Step>> callProducerStepsByResultNode = new HashMap<>();
     private final Map<String, List<ValueNodeRecord>> parametersByScope = new HashMap<>();
     private final Map<String, List<ValueNodeRecord>> callParametersByArgumentNode = new HashMap<>();
     private final Map<String, List<CallEdgeRecord>> callsByResultNode = new HashMap<>();
+    private final Set<String> unresolvedConsumerNodeIds = new HashSet<>();
+    private final Set<String> callConsumerNodeIds = new HashSet<>();
     private final Map<String, List<ValueNodeRecord>> returnsByScope = new HashMap<>();
     private final Map<String, List<ValueNodeRecord>> dataSourcesByDestination = new HashMap<>();
     private final Set<String> supportedFieldPaths = new HashSet<>();
     private final Set<String> fieldNodeKeys = new HashSet<>();
     private final Map<String, List<ValueNodeRecord>> objectNodesByScopeAndName = new HashMap<>();
+    private final Map<String, List<ValueNodeRecord>> fieldNodesByScopeAndPath = new HashMap<>();
     private final Set<String> containerElementKeys = new HashSet<>();
     private final Set<String> externalCallResultNodeIds = new HashSet<>();
     private final Map<String, String> externalReasonByResultValueId = new LinkedHashMap<>();
@@ -86,6 +91,18 @@ final class LineageIndex {
                         node.rootName(),
                         node.accessPath()
                 ));
+                if (!isEmpty(node.accessPath())) {
+                    index.fieldNodesByScopeAndPath
+                            .computeIfAbsent(
+                                    index.fieldNodeKey(
+                                            node.scopeSymbolId(),
+                                            node.rootName(),
+                                            node.accessPath()
+                                    ),
+                                    ignored -> new ArrayList<>()
+                            )
+                            .add(node);
+                }
             }
             if (isEmpty(node.accessPath())) {
                 index.objectNodesByScopeAndName
@@ -193,6 +210,14 @@ final class LineageIndex {
                 index.addStep(bridge.srcValueId(), bridge.dstValueId(), bridge.step());
             }
         }
+        /*
+         * Bridges carry object-valued field paths across method boundaries.
+         * Object-valued detection therefore runs after bridge registration,
+         * and the receiver field expansions are registered last.
+         */
+        index.buildObjectValuedFields();
+        index.propagateObjectValuedFieldsAcrossBridges();
+        index.buildObjectFieldReadExpansions();
         return index;
     }
 
@@ -290,10 +315,95 @@ final class LineageIndex {
         return valueId == null ? null : externalReasonByResultValueId.get(valueId);
     }
 
+    /**
+     * A terminal value is only "unused" when no analysed call consumes it. If
+     * the same carrier appears as a receiver or argument of an unresolved call
+     * the honest state is "used, but the consumer body is not bridged".
+     */
+    // 作用：判断值是否被未桥接的调用消费；逻辑：检查根节点与具体字段节点是否出现在未解析调用的接收者或实参中。
+    boolean hasUnresolvedConsumer(ValueRef ref) {
+        return hasConsumer(ref, unresolvedConsumerNodeIds);
+    }
+
+    /**
+     * A resolved void method has no value to consume downstream. Its
+     * CALL_RESULT node is bookkeeping for the call expression, not a field or
+     * leaf, so it must not appear as a terminal {@code NO_USE} boundary.
+     */
+    // 作用：判断调用结果是否来自已解析的 void 方法；逻辑：所有绑定调用都有方法体但没有任何返回值节点。
+    boolean isVoidCallResult(String nodeId) {
+        List<CallEdgeRecord> calls = callsByResultNode.getOrDefault(nodeId, List.of());
+        if (calls.isEmpty()) {
+            return false;
+        }
+        return calls.stream().allMatch(call -> {
+            if (call.calleeSymbolId() == null) {
+                return false;
+            }
+            /*
+             * A RETURN node is created for every non-constructor callable, so
+             * its existence is not proof of a value. A void method has a
+             * RETURN node with no incoming value evidence.
+             */
+            return returnsByScope.getOrDefault(call.calleeSymbolId(), List.of()).stream()
+                    .noneMatch(returnNode -> !incomingByNode
+                            .getOrDefault(returnNode.valueId(), List.of())
+                            .isEmpty());
+        });
+    }
+
+    // 作用：判断值是否被任意调用消费；逻辑：与未桥接判断共用根节点与具体字段节点的查找规则。
+    boolean hasCallConsumer(ValueRef ref) {
+        return hasConsumer(ref, callConsumerNodeIds);
+    }
+
+    // 作用：在指定消费者集合中查值；逻辑：先查根节点，再按字段展开定位具体字段节点。
+    private boolean hasConsumer(ValueRef ref, Set<String> consumers) {
+        if (ref == null) {
+            return false;
+        }
+        if (consumers.contains(ref.nodeId())) {
+            return true;
+        }
+        for (FieldExpansion expansion : fieldExpansionsByNode.getOrDefault(ref.nodeId(), List.of())) {
+            if (ref.fields().equals(expansion.path())
+                    && consumers.contains(expansion.pathStep().target().nodeId())) {
+                return true;
+            }
+        }
+        ValueNodeRecord node = nodesById.get(ref.nodeId());
+        return node != null && consumers.contains(node.valueId());
+    }
+
     // 作用：建立调用相关索引；逻辑：按作用域、参数、返回值与调用结果节点分组。
     private void buildCallIndexes() {
         for (CallEdgeRecord call : graph.callEdges()) {
+            /*
+             * Remember every call consumer. A terminal value that is passed to
+             * a call is "used", even when the call is void or its body is
+             * external; only a value with no consumer at all is NO_USE.
+             */
+            if (call.receiverValueId() != null) {
+                callConsumerNodeIds.add(call.receiverValueId());
+            }
+            if (call.argumentValueIds() != null) {
+                for (String argumentValueId : call.argumentValueIds()) {
+                    if (argumentValueId != null) {
+                        callConsumerNodeIds.add(argumentValueId);
+                    }
+                }
+            }
             if (call.calleeSymbolId() == null) {
+                if (call.receiverValueId() != null) {
+                    unresolvedConsumerNodeIds.add(call.receiverValueId());
+                }
+                if (call.argumentValueIds() != null) {
+                    for (String argumentValueId : call.argumentValueIds()) {
+                        if (argumentValueId != null) {
+                            unresolvedConsumerNodeIds.add(argumentValueId);
+                        }
+                    }
+                }
                 continue;
             }
             if (call.resultValueId() != null) {
@@ -390,6 +500,149 @@ final class LineageIndex {
         }
         int dot = target.lastIndexOf('.');
         return dot < 0 ? target : target.substring(dot + 1);
+    }
+
+    /**
+     * Identifies fields whose stored value is itself an object. A JavaBean
+     * setter such as {@code holder.setOrderRequest(request)} stores the object
+     * reference, so a later getter exposes a value whose fields are a new
+     * path — not {@code holder.orderRequest.channel} continuing the storage
+     * path. This distinction lets field paths cross object-valued properties
+     * without inventing a field on the holder.
+     */
+    // 作用：标记对象值的字段；逻辑：字段写入来源为对象载体（或其本身为对象值字段）时递归标记，直到稳定。
+    private void buildObjectValuedFields() {
+        boolean changed = true;
+        int guard = 0;
+        while (changed && guard++ < 32) {
+            changed = false;
+            for (ValueNodeRecord node : nodesById.values()) {
+                if (isEmpty(node.accessPath()) || objectValuedFieldIds.contains(node.valueId())) {
+                    continue;
+                }
+                boolean objectValued = incomingByNode
+                        .getOrDefault(node.valueId(), List.of())
+                        .stream()
+                        .anyMatch(step -> carriesObjectValue(step.source())
+                                && ("FIELD_WRITE".equals(step.edgeType())
+                                || "FIELD_READ".equals(step.edgeType())
+                                || "ARGUMENT_TO".equals(step.edgeType())
+                                || "RETURN_FROM".equals(step.edgeType())
+                                || "ASSIGNED_FROM".equals(step.edgeType())));
+
+                if (objectValued) {
+                    objectValuedFieldIds.add(node.valueId());
+                    objectValuedFieldPaths.add(fieldNodeKey(
+                            node.scopeSymbolId(), node.rootName(), node.accessPath()));
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // 作用：判断来源引用是否携带对象引用；逻辑：空路径的对象载体为真，字段来源则递归查其是否已被标记为对象值字段。
+    private boolean carriesObjectValue(ValueRef ref) {
+        ValueNodeRecord source = nodesById.get(ref.nodeId());
+        if (source == null) {
+            return false;
+        }
+        if (!isEmpty(source.accessPath())) {
+            return objectValuedFieldIds.contains(source.valueId())
+                    || (!isEmpty(source.accessPath()) && objectValuedFieldPaths.contains(
+                    fieldNodeKey(source.scopeSymbolId(), source.rootName(), source.accessPath())));
+        }
+        return switch (source.valueKind()) {
+            case "PARAMETER", "LOCAL", "EXPRESSION", "CALL_RESULT", "CONSTRUCTOR_RESULT", "FIELD" -> true;
+            default -> false;
+        };
+    }
+
+    // 作用：判断字段是否存储对象引用；逻辑：查对象值字段标记集合。
+    private boolean isObjectValuedField(ValueNodeRecord field) {
+        if (field == null) {
+            return false;
+        }
+        return objectValuedFieldIds.contains(field.valueId())
+                || (!isEmpty(field.accessPath()) && objectValuedFieldPaths.contains(
+                fieldNodeKey(field.scopeSymbolId(), field.rootName(), field.accessPath())));
+    }
+
+    /**
+     * A parameter that stores an object-valued field in the caller carries the
+     * same field semantics into the callee. Propagate the marked field path
+     * along ARGUMENT_TO and RETURN_FROM bridges so a getter in another method
+     * is still treated as an object hand-off.
+     */
+    // 作用：跨调用边界传播对象值字段路径；逻辑：沿对象的实参与返回值桥接，把相同的访问路径标记到目标对象。
+    private void propagateObjectValuedFieldsAcrossBridges() {
+        boolean changed = true;
+        int guard = 0;
+        while (changed && guard++ < 32) {
+            changed = false;
+            for (String key : List.copyOf(objectValuedFieldPaths)) {
+                String[] parts = key.split("\u0002", -1);
+                if (parts.length < 3) {
+                    continue;
+                }
+                String scope = parts[0];
+                String rootName = parts[1];
+                List<String> path = List.of(parts[2].split("\u0001", -1));
+                for (ValueNodeRecord root : objectNodesByScopeAndName.getOrDefault(
+                        scopeAndValue(scope, rootName), List.of())) {
+                    for (Step step : outgoingByNode.getOrDefault(root.valueId(), List.of())) {
+                        if (!"ARGUMENT_TO".equals(step.edgeType())
+                                && !"RETURN_FROM".equals(step.edgeType())) {
+                            continue;
+                        }
+                        ValueNodeRecord target = nodesById.get(step.target().nodeId());
+                        if (target == null || !isEmpty(target.accessPath())) {
+                            continue;
+                        }
+                        String targetKey = fieldNodeKey(
+                                target.scopeSymbolId(), target.canonicalValue(), path);
+                        if (objectValuedFieldPaths.add(targetKey)) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Object-valued getters hand the stored object to a local or field. Make
+     * that receiver expose its own field expansions in the index, otherwise a
+     * queried object field can reach the receiver yet still be reported as a
+     * terminal {@code NO_USE} node by the boundary projection.
+     */
+    // 作用：为对象值 getter 的接收者登记字段展开出边；逻辑：按读取边目标根节点补入展开步并去重。
+    private void buildObjectFieldReadExpansions() {
+        Set<String> added = new HashSet<>();
+        for (ValueNodeRecord field : nodesById.values()) {
+            if (!isObjectValuedField(field)) {
+                continue;
+            }
+            for (Step read : outgoingByNode.getOrDefault(field.valueId(), List.of())) {
+                if (!"FIELD_READ".equals(read.edgeType())) {
+                    continue;
+                }
+                ValueNodeRecord receiver = nodesById.get(read.target().nodeId());
+                if (receiver == null || !isEmpty(receiver.accessPath())) {
+                    continue;
+                }
+                for (FieldExpansion expansion : fieldExpansionsByNode.getOrDefault(
+                        receiver.valueId(), List.of())) {
+                    String key = receiver.valueId() + "\u0001" + String.join(".", expansion.path());
+                    if (!added.add(key)) {
+                        continue;
+                    }
+                    outgoingByNode
+                            .computeIfAbsent(receiver.valueId(), ignored -> new ArrayList<>())
+                            .add(expansion.emptyStep());
+                    stepByEvidenceId.put(expansion.emptyStep().evidenceId(), expansion.emptyStep());
+                }
+            }
+        }
     }
 
     // 作用：建立字段展开索引；逻辑：从字段节点与数据边推导可展开的字段路径。
@@ -648,6 +901,10 @@ final class LineageIndex {
                                 visiting
                         );
                     }
+                } else if (ref.fields().size() > expansion.path().size()
+                        && ref.fields().subList(0, expansion.path().size()).equals(expansion.path())
+                        && isObjectValuedField(nodesById.get(expansion.pathStep().target().nodeId()))) {
+                    collectObjectValuedFieldIncoming(expansion, ref, result, visiting);
                 }
             }
         }
@@ -687,6 +944,56 @@ final class LineageIndex {
         visiting.remove(fieldRef);
     }
 
+    /**
+     * A deep path such as {@code holder.orderRequest.channel} crosses a field
+     * whose value is an object. The storage field keeps only its own segment;
+     * the remaining suffix belongs to the object that was written into it, so
+     * the producer of {@code orderRequest} receives the suffix while the
+     * holder field segment is consumed.
+     */
+    // 作用：跨对象值字段回溯；逻辑：把深层字段路径去掉存储字段段后，投影到该字段的对象来源上。
+    private void collectObjectValuedFieldIncoming(
+            FieldExpansion expansion,
+            ValueRef ref,
+            List<Step> result,
+            Set<ValueRef> visiting
+    ) {
+        ValueNodeRecord field = nodesById.get(expansion.pathStep().target().nodeId());
+        if (field == null) {
+            return;
+        }
+        List<String> rest = List.copyOf(
+                ref.fields().subList(expansion.path().size(), ref.fields().size())
+        );
+        ValueRef fieldRef = new ValueRef(field.valueId(), rest, ref.callContext());
+        if (!visiting.add(fieldRef)) {
+            return;
+        }
+        for (Step step : incomingByNode.getOrDefault(field.valueId(), List.of())) {
+            ValueRef previous = transitionIncoming(step, fieldRef);
+            if (previous == null) {
+                continue;
+            }
+            ValueNodeRecord source = nodesById.get(previous.nodeId());
+            if ("FIELD_WRITE".equals(step.edgeType())
+                    && source != null
+                    && isEmpty(source.accessPath())) {
+                result.add(step.withSource(new ValueRef(
+                        previous.nodeId(), rest, previous.callContext()
+                )));
+                continue;
+            }
+            if (source != null && !isEmpty(source.accessPath())) {
+                result.add(step.withSource(composeFieldPath(previous, rest)));
+                continue;
+            }
+            result.add(step.withSource(new ValueRef(
+                    previous.nodeId(), rest, previous.callContext()
+            )));
+        }
+        visiting.remove(fieldRef);
+    }
+
     // 作用：取节点的出边步；逻辑：合并直接边、容器展开与字段传播结果。
     List<Step> outgoing(ValueRef ref) {
         List<Step> result = new ArrayList<>();
@@ -703,6 +1010,21 @@ final class LineageIndex {
             ValueRef projectedContainerField = projectContainerFieldWrite(step, current, next);
             if (projectedContainerField != null) {
                 result.add(step.withSource(current).withTarget(projectedContainerField));
+                continue;
+            }
+            ValueNodeRecord nextNode = nodesById.get(next.nodeId());
+            if (!current.fields().isEmpty()
+                    && "FIELD_READ".equals(step.edgeType())
+                    && "field expansion".equals(step.operation())
+                    && nextNode != null
+                    && !isEmpty(nextNode.accessPath())
+                    && current.fields().equals(nextNode.accessPath())) {
+                /*
+                 * The selected field already represents this expansion; its
+                 * concrete outgoing evidence is handled below by
+                 * addConcreteFieldOutgoing. Emitting the expansion again here
+                 * would create a field-to-itself self loop.
+                 */
                 continue;
             }
             ValueRef selectedFieldTarget = selectedFieldTarget(step, current, next);
@@ -915,7 +1237,7 @@ final class LineageIndex {
              * A concrete field path may cross this edge only when either side
              * has concrete evidence for that path. A call result can provide
              * that evidence through its callee return object, which is how
-             * {@code agreementSignBO = querySignInfo(...)} continues from a
+             * {@code orderRequest = querySignInfo(...)} continues from a
              * caller local back into the returned object fields.
              */
             return supportsFieldPath(step.source().nodeId(), fields)
@@ -962,14 +1284,51 @@ final class LineageIndex {
             FieldExpansion expansion,
             List<Step> result
     ) {
-        ValueNodeRecord field = nodesById.get(expansion.pathStep().target().nodeId());
-        if (field == null) {
+        ValueNodeRecord primary = nodesById.get(expansion.pathStep().target().nodeId());
+        if (primary == null) {
             return;
         }
+        /*
+         * A field can have several SSA versions in one scope: the write in one
+         * statement and the later read in another are distinct nodes with the
+         * same root and access path. A query must follow the outgoing evidence
+         * of every version, not only the first one the expansion selected.
+         */
+        List<ValueNodeRecord> versions = fieldNodesByScopeAndPath.getOrDefault(
+                fieldNodeKey(primary.scopeSymbolId(), primary.rootName(), primary.accessPath()),
+                List.of(primary)
+        );
+        boolean objectValued = versions.stream().anyMatch(this::isObjectValuedField);
+        for (ValueNodeRecord field : versions) {
+            addConcreteFieldVersionOutgoing(selected, field, objectValued, result);
+        }
+    }
+
+    // 作用：处理单个字段版本的下游边；逻辑：对象值 getter 单独投影，其余按目标节点形态转交。
+    private void addConcreteFieldVersionOutgoing(
+            ValueRef selected,
+            ValueNodeRecord field,
+            boolean objectValued,
+            List<Step> result
+    ) {
         ValueRef concrete = new ValueRef(field.valueId(), List.of(), selected.callContext());
         for (Step step : outgoingByNode.getOrDefault(field.valueId(), List.of())) {
             ValueRef next = transitionOutgoing(step, concrete);
             if (next == null) {
+                continue;
+            }
+            if (objectValued
+                    && "FIELD_READ".equals(step.edgeType())
+                    && next.fields().isEmpty()) {
+                /*
+                 * A getter of an object-valued property returns the stored
+                 * object, not a deeper property path. Continue from the
+                 * receiver object and expose the fields that are actually read
+                 * from it, so setXxx(...) -> getXxx() does not dead-end.
+                 */
+                result.add(step.withSource(selected).withTarget(
+                        new ValueRef(next.nodeId(), List.of(), next.callContext())
+                ));
                 continue;
             }
             ValueRef target = selectedFieldTarget(step, selected, next);
@@ -977,36 +1336,41 @@ final class LineageIndex {
                 result.add(step.withSource(selected).withTarget(target));
                 continue;
             }
-            if ("SQL_PARAMETER".equals(step.edgeType())) {
-                result.add(step.withSource(selected).withTarget(
-                        new ValueRef(next.nodeId(), List.of(), next.callContext())
-                ));
-                continue;
-            }
             ValueNodeRecord targetNode = nodesById.get(next.nodeId());
-            if (targetNode != null && "CONTAINER_ELEMENT".equals(targetNode.valueKind())) {
-                result.add(step.withSource(selected).withTarget(
-                        new ValueRef(next.nodeId(), List.of(), next.callContext())
-                ));
-                continue;
-            }
-            if (targetNode != null && !isEmpty(targetNode.accessPath())) {
+            if ("SQL_PARAMETER".equals(step.edgeType())
+                    || (targetNode != null && "CONTAINER_ELEMENT".equals(targetNode.valueKind()))
+                    || (targetNode != null && !isEmpty(targetNode.accessPath()))) {
                 // A concrete field may flow into a differently named field,
-                // for example builder().tenantId(source.getTenantId()) or a
-                // bean-copy property projection. Keep the explicit concrete
-                // target instead of dropping the edge or appending the source
-                // field path to the destination object.
+                // a container element, or a SQL bind. Keep the explicit
+                // target instead of appending the source field path.
                 result.add(step.withSource(selected).withTarget(
                         new ValueRef(next.nodeId(), List.of(), next.callContext())
                 ));
                 continue;
             }
-            if (preservesSelectedField(step)) {
+            boolean preserves = preservesSelectedField(step)
+                    && targetNode != null
+                    && "CALL_RESULT".equals(targetNode.valueKind())
+                    && !selected.fields().isEmpty()
+                    && supportsFieldPath(targetNode.valueId(), selected.fields());
+            if (preserves) {
                 result.add(step.withSource(selected).withTarget(new ValueRef(
                         next.nodeId(),
                         selected.fields(),
                         next.callContext()
                 )));
+            } else if ("FIELD_READ".equals(step.edgeType())
+                    && targetNode != null
+                    && isEmpty(targetNode.accessPath())) {
+                /*
+                 * The read value becomes the target object/scalar itself. Do
+                 * not append the selected field name: for
+                 * {@code String value = object.getStatus()} the result is
+                 * {@code value}, not {@code value.status}.
+                 */
+                result.add(step.withSource(selected).withTarget(
+                        new ValueRef(next.nodeId(), List.of(), next.callContext())
+                ));
             }
         }
     }
@@ -1037,7 +1401,7 @@ final class LineageIndex {
     /**
      * A parameter can carry a field into another callee even when that method
      * does not read the field directly. For example, autoPay forwards
-     * agreementSignBO through executeSubmitOrder before createTaxParam reads
+     * orderRequest through executeSubmitOrder before buildInvoice reads
      * addressId. Checking only the first callee's local field expansions stops
      * every such forward chain at the method boundary.
      */
@@ -1070,10 +1434,10 @@ final class LineageIndex {
          * edges; concrete field edges are handled by fieldExpansionsByNode.
          * This is the bridge from:
          *
-         *   personDaiKouConfig = baseCommonService.getPersonDaiKouConfig(...)
+         *   merchantConfig = paymentService.fetchMerchantConfig(...)
          *
          * back to the external call-result boundary without treating pin or
-         * auctionId query keys as sources of the field.
+         * orderId query keys as sources of the field.
          */
         for (Step step : incomingByNode.getOrDefault(nodeId, List.of())) {
             if (!"ASSIGNED_FROM".equals(step.edgeType()) || !step.propagateFields()) {
@@ -1343,7 +1707,7 @@ final class LineageIndex {
 
     /**
      * Keeps the persisted kind vocabulary stable while exposing the same
-     * distinctions PCA uses in its result contract.
+     * distinctions the shared result contract uses.
      */
     // 作用：生成节点类型展示名；逻辑：按类型与字段名归类。
     private String displayKind(String kind, String displayName) {

@@ -251,6 +251,31 @@ public final class MethodCallResolver {
                 ? List.of()
                 : attribution.parameterTypes())
                 + ")";
+        /*
+         * The declaring interface may live in a dependency JAR while its
+         * implementation is analysed source. Follow the source implementation
+         * before declaring an external boundary so RPC/service argument and
+         * return field bridges still connect.
+         */
+        List<SourceTypeCatalog.MethodInfo> sourceImplementations =
+                catalog.findConcreteOverrides(
+                        owner,
+                        methodName,
+                        argumentCount,
+                        attribution.parameterTypes() == null
+                                ? List.of()
+                                : attribution.parameterTypes()
+                );
+        if (sourceImplementations.size() == 1) {
+            SourceTypeCatalog.MethodInfo implementation = sourceImplementations.get(0);
+            return CallResolution.virtualUnique(implementation.symbolId(), implementation.qname());
+        }
+        if (sourceImplementations.size() > 1) {
+            return CallResolution.virtualAmbiguous(sourceImplementations.stream()
+                    .map(implementation -> new CallResolution.Target(
+                            implementation.symbolId(), implementation.qname()))
+                    .toList());
+        }
         String reason;
         String rpcBoundary = rpcReason(owner, methodName);
         if (rpcBoundary != null) {
@@ -536,14 +561,11 @@ public final class MethodCallResolver {
             if (method.hasBody() || !catalog.isPolymorphic(typeQname)) {
                 return CallResolution.compileTimeTarget(method.symbolId(), method.qname());
             }
-            List<SourceTypeCatalog.MethodInfo> implementations =
-                    catalog.findConcreteOverrides(typeQname, methodName, argumentCount);
-            if (implementations.size() == 1) {
-                SourceTypeCatalog.MethodInfo implementation = implementations.get(0);
-                return CallResolution.virtualUnique(
-                        implementation.symbolId(),
-                        implementation.qname()
-                );
+            CallResolution implementationResolution = resolveConcreteImplementations(
+                    typeQname, methodName, argumentCount, reduced
+            );
+            if (implementationResolution != null) {
+                return implementationResolution;
             }
             return decide(reduced, fallbackQname, typeQname, methodName);
         }
@@ -551,14 +573,53 @@ public final class MethodCallResolver {
             return decide(reduced, fallbackQname, typeQname, methodName);
         }
         if (catalog.isPolymorphic(typeQname)) {
-            List<SourceTypeCatalog.MethodInfo> implementations =
-                    catalog.findConcreteOverrides(typeQname, methodName, argumentCount);
-            if (implementations.size() == 1) {
-                SourceTypeCatalog.MethodInfo implementation = implementations.get(0);
-                return CallResolution.virtualUnique(implementation.symbolId(), implementation.qname());
+            CallResolution implementationResolution = resolveConcreteImplementations(
+                    typeQname, methodName, argumentCount, reduced
+            );
+            if (implementationResolution != null) {
+                return implementationResolution;
             }
         }
         return decide(reduced, fallbackQname, typeQname, methodName);
+    }
+
+    /**
+     * Resolves the method bodies a virtual call can reach. A single concrete
+     * override is an exact virtual target; several overrides remain ambiguous
+     * but are still returned so the call site can bridge arguments and return
+     * values into every possible implementation body.
+     */
+    // 作用：解析抽象声明的具体实现；逻辑：按擦除后的声明签名筛选子类型实现，唯一实现升级为虚调用，多实现保留候选。
+    private CallResolution resolveConcreteImplementations(
+            String typeQname,
+            String methodName,
+            int argumentCount,
+            List<SourceTypeCatalog.MethodInfo> declarations
+    ) {
+        List<String> declaredTypes = declarations.isEmpty()
+                ? List.of()
+                : declarations.get(0).parameterTypes();
+        List<SourceTypeCatalog.MethodInfo> implementations =
+                catalog.findConcreteOverrides(
+                        typeQname, methodName, argumentCount, declaredTypes
+                );
+        if (implementations.isEmpty()) {
+            return null;
+        }
+        if (implementations.size() == 1) {
+            SourceTypeCatalog.MethodInfo implementation = implementations.get(0);
+            return CallResolution.virtualUnique(
+                    implementation.symbolId(),
+                    implementation.qname()
+            );
+        }
+        List<CallResolution.Target> targets = implementations.stream()
+                .map(implementation -> new CallResolution.Target(
+                        implementation.symbolId(),
+                        implementation.qname()
+                ))
+                .toList();
+        return CallResolution.virtualAmbiguous(targets);
     }
 
     // 作用：比较声明签名与实际调用签名；逻辑：区分普通参数与可变参数，逐项校验类型和数量。
@@ -777,17 +838,11 @@ public final class MethodCallResolver {
             return decide(candidates, fallbackQname, typeQname, methodName);
         }
         if (catalog.isPolymorphic(typeQname)) {
-            List<SourceTypeCatalog.MethodInfo> implementations =
-                    catalog.findConcreteOverrides(typeQname, methodName, argumentCount);
-            if (implementations.size() == 1) {
-                SourceTypeCatalog.MethodInfo implementation = implementations.get(0);
-                return CallResolution.virtualUnique(implementation.symbolId(), implementation.qname());
-            }
-            if (!implementations.isEmpty()) {
-                return CallResolution.candidate(
-                        fallbackQname,
-                        implementations.stream().map(SourceTypeCatalog.MethodInfo::qname).toList()
-                );
+            CallResolution implementationResolution = resolveConcreteImplementations(
+                    typeQname, methodName, argumentCount, candidates
+            );
+            if (implementationResolution != null) {
+                return implementationResolution;
             }
         }
         return decide(candidates, fallbackQname, typeQname, methodName);

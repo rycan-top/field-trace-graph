@@ -233,7 +233,7 @@ public final class CallValueFlowExtractor {
         // A call result is produced by the invocation on its receiver. Keep
         // every instance receiver as a value-flow input so external or
         // unresolved calls such as provider.get(...) and
-        // baseCommonService.getPersonDaiKouConfig(...) still have a producer.
+        // paymentService.fetchMerchantConfig(...) still have a producer.
         // Type-qualified static calls are not instance producers and are
         // deliberately excluded.
         if (receiver instanceof com.github.javaparser.ast.expr.NameExpr name

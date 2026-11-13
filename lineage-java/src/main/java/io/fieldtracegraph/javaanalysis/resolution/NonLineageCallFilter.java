@@ -92,7 +92,7 @@ public final class NonLineageCallFilter {
 
     // 作用：综合判断调用是否为血缘噪声；逻辑：排除诊断、日志、监控、纯转换与控制条件调用，但保留 JSON 序列化。
     public boolean shouldIgnore(MethodCallExpr call, JavaValueFlowContext context) {
-        if (hasDiagnosticAncestor(call)) {
+        if (isInDiagnosticContext(call)) {
             return true;
         }
         if ("toJSONString".equals(call.getNameAsString())) {
@@ -143,7 +143,7 @@ public final class NonLineageCallFilter {
     }
 
     // 作用：判断调用是否位于诊断或日志调用内部；逻辑：向上遍历到方法边界，命中诊断类父调用即返回真。
-    private boolean hasDiagnosticAncestor(MethodCallExpr call) {
+    public boolean isInDiagnosticContext(MethodCallExpr call) {
         for (Node ancestor = call.getParentNode().orElse(null);
              ancestor != null;
              ancestor = ancestor.getParentNode().orElse(null)) {

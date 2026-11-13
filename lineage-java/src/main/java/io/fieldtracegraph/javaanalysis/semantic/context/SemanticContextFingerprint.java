@@ -33,8 +33,11 @@ public final class SemanticContextFingerprint {
      * 0.4.12: keep static type receivers and narrow Dubbo RPC prefixes.
      * 0.5.3: vendor-neutral RPC boundaries (Dubbo/gRPC/Thrift/CXF/JAX-WS) and
      * open-source telemetry markers (Micrometer/OpenTelemetry/Prometheus).
+     * 0.5.4: exclude serializer calls nested in logging/diagnostic calls.
+     * 0.5.5: bridge every source implementation of an abstract/RPC call and
+     *        preserve object-valued property hand-offs.
      */
-    public static final String RULE_VERSION = "0.5.3";
+    public static final String RULE_VERSION = "0.5.5";
 
     // 作用：按显式 classpath 计算上下文指纹；逻辑：先把命令行条目纳入校验指纹，再转交核心计算。
     public String compute(

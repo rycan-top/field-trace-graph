@@ -8,6 +8,7 @@ import io.fieldtracegraph.javaanalysis.CallableScope;
 import io.fieldtracegraph.javaanalysis.JavaAnalysisAccumulator;
 import io.fieldtracegraph.javaanalysis.flow.CallableOwnership;
 import io.fieldtracegraph.javaanalysis.flow.JavaValueFlowContext;
+import io.fieldtracegraph.javaanalysis.resolution.NonLineageCallFilter;
 
 import java.util.Map;
 import java.util.Set;
@@ -24,6 +25,7 @@ public final class ContainerSerializationFlowExtractor {
     private static final Set<String> JSON_SERIALIZERS = Set.of("toJSONString", "toJSON");
 
     private final ValueEdgeEmitter edgeEmitter = new ValueEdgeEmitter();
+    private final NonLineageCallFilter nonLineageCallFilter = new NonLineageCallFilter();
 
     // 作用：提取容器序列化流；逻辑：识别序列化调用，把容器内各条目连接到序列化结果节点。
     public void extract(
@@ -36,6 +38,9 @@ public final class ContainerSerializationFlowExtractor {
         int ordinal = 0;
         for (MethodCallExpr call : scope.callable().findAll(MethodCallExpr.class)) {
             if (!CallableOwnership.belongsToCallableOrAnonymousBody(call, scope.callable())) {
+                continue;
+            }
+            if (nonLineageCallFilter.isInDiagnosticContext(call)) {
                 continue;
             }
             String containerKey = serializedContainerKey(call, context);

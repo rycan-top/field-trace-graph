@@ -9,6 +9,7 @@ import io.fieldtracegraph.core.model.MethodsResult;
 import io.fieldtracegraph.core.model.SourceResult;
 import io.fieldtracegraph.core.model.TargetsResult;
 import io.fieldtracegraph.core.model.TraceResult;
+import io.fieldtracegraph.core.query.TraceCompleteness;
 import io.fieldtracegraph.core.query.TraceQuality;
 
 import java.util.HashMap;
@@ -61,6 +62,9 @@ public class TextResultView {
         }
         if (result.data() instanceof EvidenceImportResult imported) {
             return "Imported evidence: " + imported.importedEvidenceCount();
+        }
+        if (result.data() instanceof String text) {
+            return text;
         }
         if (result.data() instanceof EvidenceDiffResult diff) {
             StringBuilder builder = new StringBuilder();
@@ -125,7 +129,9 @@ public class TextResultView {
         builder.append("Method: ").append(result.methodQname()).append('\n');
         builder.append("Target: ").append(result.targetExpression()).append('\n');
         builder.append("Direction: ").append(result.direction()).append('\n');
-        builder.append("Trace quality: ").append(TraceQuality.from(result).summary()).append('\n');
+        builder.append("Trace quality: ")
+                .append(TraceQuality.from(result, result.allowCandidate(), result.failOnCandidate()).summary())
+                .append('\n');
         builder.append("Nodes:").append('\n');
         for (var node : result.nodes()) {
             if (node.internal()) {
@@ -154,6 +160,7 @@ public class TextResultView {
                             .append(':')
                             .append(node.lineStart())
                             .append('\n'));
+            appendRemainder(builder, internalNodes, 10, "internal version");
         }
         Map<String, String> nodeLabels = nodeLabels(result);
         Map<String, String> shortLabels = shortLabels(result);
@@ -180,7 +187,9 @@ public class TextResultView {
             builder.append('\n');
         }
         builder.append("Chains: ").append(result.chains().size()).append('\n');
-        result.chains().stream().limit(10).forEach(chain -> {
+        // Text output is a projection of the authoritative chain list; never
+        // silently drop the tail of a large field trace.
+        result.chains().forEach(chain -> {
             builder.append("  ")
                     .append(chainDisplay(chain.nodeIds(), shortLabels))
                     .append(" (weak=")
@@ -244,8 +253,9 @@ public class TextResultView {
                         .append('\t')
                         .append(candidate.suggestedAction())
                         .append('\n'));
+        appendRemainder(builder, result.ambiguousCandidates().size(), 10, "ambiguous candidate");
         builder.append("Weak hops: ").append(result.weakHops().size()).append('\n');
-        result.weakHops().stream().limit(10).forEach(hop ->
+        result.weakHops().forEach(hop ->
                 builder.append("  ")
                         .append(hop.callerQname() == null ? hop.callerSymbolId() : hop.callerQname())
                         .append(" -> ")
@@ -305,22 +315,16 @@ public class TextResultView {
         return builder.toString();
     }
 
-    // 作用：判定结果完整性；逻辑：按未知、证据不足、部分、过期与完整顺序返回状态。
+    // 作用：判定结果完整性；逻辑：委托完整性模型，把弱跳与未桥接消费者计入结论。
     private String completeness(TraceResult result) {
-        TraceQuality quality = TraceQuality.from(result);
-        if (quality.unknown()) {
-            return "UNKNOWN";
+        return TraceCompleteness.from(result).summary();
+    }
+
+    // 作用：提示被折叠的剩余条目；逻辑：总数超过展示上限时追加一行明确数量，避免静默截断。
+    private void appendRemainder(StringBuilder builder, long total, int shown, String label) {
+        if (total > shown) {
+            builder.append("  ... ").append(total - shown).append(" more ").append(label).append("(s)\n");
         }
-        if (quality.insufficient()) {
-            return "INSUFFICIENT";
-        }
-        if (quality.partial() || result.truncated() || !result.snapshotConsistent()) {
-            return "PARTIAL";
-        }
-        if ("STALE".equals(result.freshness())) {
-            return "INCOMPLETE";
-        }
-        return "COMPLETE";
     }
 
     // 作用：构建节点完整标签；逻辑：拼接类型、展示名、作用域与行号。

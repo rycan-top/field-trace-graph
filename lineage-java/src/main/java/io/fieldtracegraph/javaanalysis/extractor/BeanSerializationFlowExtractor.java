@@ -13,6 +13,7 @@ import io.fieldtracegraph.javaanalysis.JavaAnalysisAccumulator;
 import io.fieldtracegraph.javaanalysis.flow.CallableOwnership;
 import io.fieldtracegraph.javaanalysis.flow.JavaValueFlowContext;
 import io.fieldtracegraph.javaanalysis.resolution.ExpressionTypeResolver;
+import io.fieldtracegraph.javaanalysis.resolution.NonLineageCallFilter;
 import io.fieldtracegraph.javaanalysis.resolution.SourceTypeCatalog;
 
 import java.util.LinkedHashSet;
@@ -41,6 +42,7 @@ public final class BeanSerializationFlowExtractor {
     );
 
     private final ValueNodeCatalog nodeCatalog = new ValueNodeCatalog();
+    private final NonLineageCallFilter nonLineageCallFilter = new NonLineageCallFilter();
 
     // 作用：提取 Bean 序列化字段流；逻辑：识别序列化调用，按类型目录展开字段并生成候选证据边。
     public void extract(
@@ -60,6 +62,9 @@ public final class BeanSerializationFlowExtractor {
         for (MethodCallExpr call : scope.callable().findAll(MethodCallExpr.class)) {
             if (!CallableOwnership.belongsToCallableOrAnonymousBody(call, scope.callable())
                     || !SERIALIZE_METHODS.contains(call.getNameAsString())) {
+                continue;
+            }
+            if (nonLineageCallFilter.isInDiagnosticContext(call)) {
                 continue;
             }
             Expression value = serializedValue(call);

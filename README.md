@@ -458,8 +458,8 @@ field-trace-graph targets --method SIGNATURE [OPTIONS]
 Lists value expressions that can be passed to `trace --target`, together with
 their kind and source location. The list includes method-scope values and
 evidence-backed field paths discovered in callees, so a parameter such as
-`agreementSignBO` also exposes `agreementSignBO.addressId`,
-`agreementSignBO.originId`, and the other fields that actually participate in
+`orderRequest` also exposes `orderRequest.addressId`,
+`orderRequest.originId`, and the other fields that actually participate in
 lineage. The method selector should normally be the full signature printed by
 `methods`; a stable method ID is also accepted for automation.
 
@@ -471,7 +471,7 @@ Targets: 45 (comparable=37 fields=29 roots=7 returns=1 calls=8)
 
 `comparable` is `fields + roots + returns`. `calls` contains
 `CALL_RESULT`/`CONSTRUCTOR_RESULT` targets such as
-`call:queryByAuctionId(1)`; they remain selectable but must not be counted as
+`call:queryByOrderId(1)`; they remain selectable but must not be counted as
 object or field lineage when comparing graph implementations.
 
 | Option | Default | Effect |
@@ -511,8 +511,13 @@ it also loads callers and may hit depth or edge limits on large call graphs.
 
 `leaves` are the directional stopping points. `weakHops` are source-visible
 calls that could not be bridged into analysed source, such as JDK or external
-services; they are explicit boundaries and do not by themselves make the result
-`PARTIAL`. Boundaries and leaves carry `evidenceId`, `sourceFile`, and
+services. Only weak hops that touch the traced value or its scope are reported;
+an unrelated call elsewhere in the same method does not degrade the field
+result. They remain explicit boundaries, but they are not treated as proof that
+the field is fully traced: `completeness` reports `PARTIAL` whenever a relevant
+weak hop exists. This separates edge quality (`quality`, which only
+looks at emitted field-value edges) from connectivity completeness. Boundaries
+and leaves carry `evidenceId`, `sourceFile`, and
 structured line/column ranges; weak hops carry `callSiteId`, `sourceFile`,
 structured line/column ranges, `resolution=UNRESOLVED`, `reasonCode`,
 `recoverable`, `suggestedAction`, and `evidenceSource`. An external call is
@@ -536,7 +541,7 @@ Each edge also carries `operation`, `depth`, `resolved`, `bridged`, `srcScope`,
 is a readable label for the edge type, so JSON consumers never need to infer a
 step from a raw ID. Call-result producer hops use `CALL_PRODUCER` and expose the
 receiver-to-result relationship, including external calls such as
-`baseCommonService.getPersonDaiKouConfig(...)`.
+`paymentService.fetchMerchantConfig(...)`.
 
 Every edge also carries `category`:
 
@@ -566,17 +571,43 @@ shows `hops=N` for each displayed chain.
 `truncated` and `truncationReasons` describe deliberately bounded output.
 `cycleDetected` means the complete deduplicated edge set contains a directed
 cycle; it is a diagnostic and is not itself a truncation. There is no fixed
-chain-count projection limit. `truncationReasons` can include `DEPTH_LIMIT`,
+chain-count projection limit, and text output prints every chain and every weak
+hop instead of a first-ten sample. `truncationReasons` can include `DEPTH_LIMIT`,
 `EDGE_LIMIT`, `SEED_LIMIT`, and `TIME_LIMIT`. Edge and depth limits remain
 explicit request options so callers can bound very large diagnostic queries
 without silently shortening the default field-lineage result. `-1` is the only
 automatic budget value; `0` and other negative values are rejected.
+
+`completeness` is the user-facing connectivity verdict. `COMPLETE` requires
+resolved field-value edges, no candidate evidence, no truncation, consistent
+snapshot evidence, and no relevant weak hop or `USE_UNRESOLVED` boundary.
+`PARTIAL` means the emitted edges are usable but a visible consumer could not be
+followed. `INSUFFICIENT`, `UNKNOWN`, and `INCOMPLETE` keep the quality-gate
+meanings described below. JSON output exposes the same value and its reasons.
+
+A terminal boundary distinguishes three different states:
+
+- `USE_UNRESOLVED`: a consumer call exists in source, but its body could not be
+  analysed. This is a bridge gap, not "unused".
+- `CONSUMED_BY_CALL`: the value is passed to a call whose result does not expose
+  the field (typically a `void` method). The consumer is real.
+- `NO_USE` / `NO_CONSUMER`: no outgoing evidence and no consuming call site in
+  the analysed source. In text output this is explicitly labelled
+  `NO_CONSUMER`; it means "no consumer found in analysed code", not a claim
+  about runtime business behaviour.
 
 A dotted target is accepted only when an analysed scope contains an
 evidence-backed field with exactly that root and access path; otherwise `trace`
 returns `NO_MATCH` with `FIELD_NOT_FOUND` instead of inventing a path. Text
 output identifies methods by complete signatures and values by expressions;
 stable IDs are present only in JSON for machine joins.
+
+Exit status follows the connectivity verdict: `COMPLETE` is `0`; a `PARTIAL` or
+`INSUFFICIENT` completeness result is the stale/incomplete code `3`. The
+`--max-weak-hops N` option remains a stricter explicit gate and returns `6`
+when its budget is exceeded. Use `--allow-resolution candidate` only when
+candidate evidence is acceptable for the run; it does not hide weak hops or
+unbridged consumers.
 
 | Option | Default | Effect |
 |---|---:|---|
@@ -689,7 +720,9 @@ Jackson `writeValueAsString`, and Gson `toJson` expand declared fields into
 field-to-result edges. Annotation-based exclusions such as `@JSONField(...,
 serialize = false)` and `@JsonIgnore` are honoured. These edges are published
 as `resolution=CANDIDATE` with `provenance=FRAMEWORK_ADAPTER`; import a runtime
-trace to confirm the fields that were actually serialized.
+trace to confirm the fields that were actually serialized. Serializer calls
+nested inside logging or telemetry calls are ignored, so
+`log.info("{}", JSON.toJSONString(bean))` does not create field-lineage edges.
 
 MyBatis mapper XML is discovered by namespace rather than a hard-coded
 `/mapper/` directory. Bind variables retain XML line/column metadata;
@@ -722,7 +755,22 @@ directories up to the project root. Modules with no static level fall back to Ja
   `ASSIGNED_FROM` value-source claim.
 - `CONDITION_USES` and `CALL_INPUT_USES` are dependency evidence, not field-value
   edges. They are excluded by default and appear only with
-  `--include-dependencies`.
+  `--include-dependencies`. Keeping `CONDITION_USES` for `if`, ternary,
+  `switch`, and guard expressions is intentional: a condition controls which
+  branch runs, not which value is produced, so it must not be promoted to a
+  field-value edge.
+- A virtual call declared on an interface or abstract class is bridged into
+  every analysed source implementation, not just the first one. Each
+  implementation edge is `CANDIDATE`; argument and return field bridges then
+  continue inside each body. A single source implementation is
+  `VIRTUAL_UNIQUE` and stays exact. This is the same dispatch rule used for
+  generic Java interfaces and for RPC-style service interfaces. The interface
+  may come from a dependency JAR; a source implementation is still bridged when
+  its erased parameter types match the call.
+- A setter that stores an object reference (`holder.setRequest(request)`) and a
+  later getter (`holder.getRequest()`) form an object-valued property bridge.
+  Fields read from the getter result continue as fields of that object, not as
+  `holder.request.field`; `void` calls do not invent a field on their result.
 - Logging, monitoring, and telemetry reads are not field lineage.
 - Unknown external calls stop at `EXTERNAL_BOUNDARY`; they are never rewritten as
   confirmed field assignment edges.
@@ -746,12 +794,12 @@ directories up to the project root. Modules with no static level fall back to Ja
 ## External classpath
 
 Place an optional `.semantic-classpath.xml` at the project root. The canonical
-format is shared with the PCA indexer:
+format is shared with the semantic classpath indexer:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <semanticClasspath version="1">
-  <module path="auction-marketing-tool-common" sourceSet="main">
+  <module path="order-service-common" sourceSet="main">
     <jar path="semantic-libs/commons-lang3-3.5.jar"
          sha256="64-lowercase-hex-characters"/>
   </module>
@@ -987,11 +1035,28 @@ a regression.
 
 ### Build A Release
 
-Build a local archive with a bundled runtime:
+Bump every version source with one command:
+
+```bash
+scripts/bump-version.sh 0.2.0
+```
+
+The Maven reactor keeps one version in the root POM's `<revision>` property; the
+four module POMs inherit it. The script updates that property, both manifests
+(`version`, the `baseUrl` release tag, and all four archive names), and the npm
+package version, then validates the result. Hashes are reset to zeros because
+new archives have not been built yet.
+
+After the bump, only these three version-bearing locations need review: the root
+POM `<revision>`, the root release manifest, and the npm package version. Archive
+names and the npm manifest copy are derived, not hand-edited.
+
+Build a local archive with a bundled runtime (the version defaults to the root
+manifest; archives are named from it):
 
 ```bash
 export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
-FTG_STRICT_RELEASE=1 VERSION=0.1.0 OS=darwin CPU=arm64 distribution/build-release.sh
+FTG_STRICT_RELEASE=1 OS=darwin CPU=arm64 distribution/build-release.sh
 ```
 
 The archive contains `bin/`, `lib/`, `runtime/`, `licenses/`, the CycloneDX SBOM,
@@ -1019,19 +1084,18 @@ hosting, and signing inputs listed in `To-do/RELEASE-CHECKLIST.md`.
 ```bash
 # Build one platform archive with a bundled runtime.
 export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
-FTG_STRICT_RELEASE=1 VERSION=0.1.0 OS=darwin CPU=arm64 \
-  distribution/build-release.sh
+FTG_STRICT_RELEASE=1 OS=darwin CPU=arm64 distribution/build-release.sh
 
 # Run the fail-closed archive and manifest verification gate.
 FTG_VERIFY_PLATFORM_ONLY=darwin-arm64 distribution/verify-release.sh
 
 # Smoke-test the unpacked archive with its bundled runtime.
 distribution/smoke-test-release.sh \
-  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
+  distribution/build/field-trace-graph-*-darwin-arm64.tar.gz
 
 # Build the npm tarball, install it into a temp prefix, and exercise the launcher.
 distribution/smoke-test-npm.sh \
-  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
+  distribution/build/field-trace-graph-*-darwin-arm64.tar.gz
 
 # Run the source, npm tarball, and archive secret/SBOM scan.
 distribution/security-scan.sh
@@ -1039,7 +1103,7 @@ distribution/security-scan.sh
 # Build and smoke-test the npm launcher locally.
 cd distribution/npm
 npm pack
-npm install -g ./field-trace-graph-0.1.0.tgz
+npm install -g ./field-trace-graph-*.tgz
 field-trace-graph --version
 field-trace-graph doctor
 ```
@@ -1052,7 +1116,7 @@ node distribution/npm/scripts/sync-manifest.js
 
 # Update one platform entry after an archive is built.
 node distribution/update-release-manifest.js \
-  darwin arm64 field-trace-graph-0.1.0-darwin-arm64.tar.gz "$SHA256"
+  darwin arm64 field-trace-graph-<version>-darwin-arm64.tar.gz "$SHA256"
 ```
 
 The build script calls the manifest updater automatically. `npm pack` runs

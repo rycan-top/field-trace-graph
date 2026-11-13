@@ -731,7 +731,7 @@ public final class BidirectionalLineageTracer {
         }
         /*
          * Object parameters are often only expanded in callees. autoPay, for
-         * example, passes agreementSignBO to createTaxParam, where addressId is
+         * example, passes orderRequest to buildInvoice, where addressId is
          * actually read. The graph already contains only the root method's
          * reachable scopes, so evidence for the same root/path in one of those
          * scopes proves the selected field exists without accepting arbitrary

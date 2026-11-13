@@ -18,7 +18,7 @@ import java.util.Set;
 /**
  * Builds the user-facing target list for one method. It combines method-scope
  * roots with evidence-backed field paths discovered in callee scopes, so a
- * parameter such as {@code agreementSignBO} exposes the fields actually read or
+ * parameter such as {@code orderRequest} exposes the fields actually read or
  * written downstream instead of only the object root.
  */
 public final class TargetCandidateResolver {
@@ -245,7 +245,7 @@ public final class TargetCandidateResolver {
         }
         /*
          * A root object is usually only read in callees: autoPay passes
-         * agreementSignBO to createTaxParam, where the actual addressId/userIp
+         * orderRequest to buildInvoice, where the actual addressId/userIp
          * fields are read. Requiring the field declaration to live in the root
          * method scope hides every such field from targets. The resolver input
          * is already limited to reachable scopes, so matching by the root name

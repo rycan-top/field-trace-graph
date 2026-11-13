@@ -9,7 +9,7 @@
     <parent>
         <groupId>io.fieldtracegraph</groupId>
         <artifactId>field-trace-graph-parent</artifactId>
-        <version>0.1.2</version>
+        <version>${revision}</version>
     </parent>
 
     <artifactId>lineage-cli</artifactId>
@@ -41,6 +41,15 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>src/main/resources-filtered</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

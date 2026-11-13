@@ -17,13 +17,13 @@ claim.
 ## Build And SBOM
 
 - [ ] `mvn clean package` passes and `target/field-trace-graph-sbom.json` exists.
-- [ ] Release `VERSION`, `release-manifest.json`, and npm `package.json` all match.
+- [ ] `scripts/bump-version.sh <version>` ran; the root POM revision, `release-manifest.json`, and npm `package.json` all match.
 - [ ] `distribution/security-scan.sh` passes for source and generated artifacts.
 - [ ] Archives built for every supported OS/CPU with a bundled JDK.
 
 ```bash
 export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
-VERSION=0.1.0 OS=darwin CPU=arm64 FTG_STRICT_RELEASE=1 distribution/build-release.sh
+OS=darwin CPU=arm64 FTG_STRICT_RELEASE=1 distribution/build-release.sh
 ```
 
 ## Hosting And Manifest
@@ -51,7 +51,7 @@ comes from `baseUrl` in `distribution/release-manifest.json`; there is no
 ```bash
 cd distribution/npm
 npm pack
-npm install -g ./field-trace-graph-0.1.0.tgz
+npm install -g ./field-trace-graph-*.tgz
 field-trace-graph --version
 field-trace-graph doctor
 ```
@@ -61,7 +61,7 @@ The archive smoke test creates a temporary Java project, runs `init`, and runs
 
 ```bash
 distribution/smoke-test-release.sh \
-  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
+  distribution/build/field-trace-graph-*-darwin-arm64.tar.gz
 ```
 
 The npm smoke test packs the thin launcher, installs it under a temporary
@@ -70,7 +70,7 @@ checks `--version` and `doctor` through the installed package:
 
 ```bash
 distribution/smoke-test-npm.sh \
-  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
+  distribution/build/field-trace-graph-*-darwin-arm64.tar.gz
 ```
 
 ## Signing

@@ -9,6 +9,7 @@ import io.fieldtracegraph.core.model.CommandResult;
 import io.fieldtracegraph.core.model.Diagnostic;
 import io.fieldtracegraph.core.model.TraceResult;
 import io.fieldtracegraph.core.query.CallScopeMode;
+import io.fieldtracegraph.core.query.TraceCompleteness;
 import io.fieldtracegraph.core.query.TraceQuality;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -170,6 +171,20 @@ public class TraceCommand implements Runnable {
                     new Diagnostic("INDEX_STALE", "The published index does not match the current source tree", null, null, false, true)
             ));
         }
+        TraceCompleteness completeness = TraceCompleteness.from(result);
+        if (completeness.status() == TraceCompleteness.Status.PARTIAL
+                || completeness.status() == TraceCompleteness.Status.INSUFFICIENT) {
+            return CommandResult.partial("trace", result, List.of(
+                    new Diagnostic(
+                            "TRACE_COMPLETENESS_" + completeness.status(),
+                            "Trace connectivity is not complete: " + completeness.summary(),
+                            null,
+                            null,
+                            false,
+                            true
+                    )
+            ));
+        }
         TraceQuality quality = TraceQuality.from(result, allowCandidate, failOnCandidate);
         if (maxWeakHops >= 0 && quality.weakHopCount() > maxWeakHops) {
             return CommandResult.partial("trace", result, List.of(
@@ -248,6 +263,11 @@ public class TraceCommand implements Runnable {
                 result.allowCandidate(),
                 result.failOnCandidate()
         );
+        TraceCompleteness completeness = TraceCompleteness.from(result);
+        if (completeness.status() == TraceCompleteness.Status.PARTIAL
+                || completeness.status() == TraceCompleteness.Status.INSUFFICIENT) {
+            return ExitCode.STALE;
+        }
         if (quality.insufficient()) {
             return ExitCode.STALE;
         }

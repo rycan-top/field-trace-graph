@@ -1,6 +1,7 @@
 package io.fieldtracegraph.cli.dto;
 
 import io.fieldtracegraph.core.model.TraceResult;
+import io.fieldtracegraph.core.query.TraceCompleteness;
 import io.fieldtracegraph.core.query.TraceQuality;
 
 import java.util.List;
@@ -32,9 +33,10 @@ public record TraceResultDto(
         boolean truncated,
         List<String> truncationReasons,
         boolean cycleDetected,
-        TraceQuality quality
+        TraceQuality quality,
+        TraceCompleteness completeness
 ) {
-    // 作用：把追踪结果转为输出 DTO；逻辑：复制各列表并附加质量门禁计算结果。
+    // 作用：把追踪结果转为输出 DTO；逻辑：复制各列表并附加质量门禁与完整性结论。
     public static TraceResultDto from(TraceResult result) {
         return new TraceResultDto(
                 result.methodId(),
@@ -60,7 +62,8 @@ public record TraceResultDto(
                 result.truncated(),
                 List.copyOf(result.truncationReasons()),
                 result.cycleDetected(),
-                TraceQuality.from(result, result.allowCandidate(), result.failOnCandidate())
+                TraceQuality.from(result, result.allowCandidate(), result.failOnCandidate()),
+                TraceCompleteness.from(result)
         );
     }
 }

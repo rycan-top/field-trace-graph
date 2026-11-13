@@ -23,6 +23,11 @@ public enum BoundaryReason {
     GENERATED_CODE_MISSING(true, "index-generated-sources-or-provide-classpath"),
     RECEIVER_TYPE_UNKNOWN(true, "trace-receiver-expression-or-import-runtime-trace"),
     OVERLOAD_AMBIGUOUS(true, "disambiguate-overload-or-provide-classpath"),
+    VIRTUAL_AMBIGUOUS(true, "provide-classpath-or-runtime-trace"),
+    USE_UNRESOLVED(true, "resolve-call-target-or-provide-classpath"),
+    CONSUMED_BY_CALL(false, "none"),
+    NO_CONSUMER(false, "none"),
+    NO_USE(false, "none"),
     RPC_BOUNDARY(true, "import-runtime-trace-or-provide-contract"),
     SERIALIZATION_BOUNDARY(true, "import-runtime-trace-or-provide-contract"),
     /** @deprecated split into {@link #RPC_BOUNDARY} and {@link #SERIALIZATION_BOUNDARY}. */

@@ -1,5 +1,7 @@
 package io.fieldtracegraph.cli.controller;
 
+import io.fieldtracegraph.cli.bootstrap.VersionInfo;
+import io.fieldtracegraph.cli.bootstrap.VersionProvider;
 import io.fieldtracegraph.core.model.CommandResult;
 import io.fieldtracegraph.cli.view.ResultView;
 import picocli.CommandLine.Command;
@@ -9,7 +11,7 @@ import picocli.CommandLine.Command;
 
 @Command(
         name = "field-trace-graph",
-        version = "field-trace-graph 0.1.0 (schema-version 1)",
+        versionProvider = VersionProvider.class,
         mixinStandardHelpOptions = true
 )
 public class RootCommand implements Runnable {
@@ -22,6 +24,9 @@ public class RootCommand implements Runnable {
     // 作用：输出根命令信息；逻辑：以文本格式打印名称与版本。
     @Override
     public void run() {
-        System.out.println(resultView.render(CommandResult.success("root", "field-trace-graph 0.1.0"), "text"));
+        System.out.println(resultView.render(
+                CommandResult.success("root", "field-trace-graph " + VersionInfo.version()),
+                "text"
+        ));
     }
 }
