@@ -1,137 +1,106 @@
+<div align="center">
+
 # field-trace-graph
 
-Local Java field-lineage CLI. It analyzes a local Java project, resolves method calls,
-and traces where a field or value comes from and where it flows to. No server, no
+**Trace any Java field back to where it comes from — one command, fully local.**
+
+`ftg` builds a field-level lineage graph of a local Java project and answers
+"where does this value come from, and where does it flow to?" — no server, no
 upload, no model, no background process.
 
-## Requirements
+[![npm version](https://img.shields.io/npm/v/field-trace-graph.svg)](https://www.npmjs.com/package/field-trace-graph)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-brightgreen.svg)](https://nodejs.org/)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue.svg)](#supported-platforms)
 
-- Published npm package: Node.js 18 or newer. No system JDK is required.
-- Build from source: JDK 17 or 21 with `javac`, Maven, and Node.js 18 or newer.
-- Release build: a redistributable JDK 17 or 21 selected with `FTG_RUNTIME_HOME`.
+```bash
+npm install -g field-trace-graph && ftg --version
+```
 
-## Install
+[Get Started](#get-started) · [Key features](#key-features) · [Commands](#command-reference) · [Troubleshooting](#troubleshooting)
+
+</div>
+
+## Contents
+
+- [Get Started](#get-started)
+- [Why field-trace-graph?](#why-field-trace-graph)
+- [Key features](#key-features)
+- [Supported platforms](#supported-platforms)
+- [Command Reference](#command-reference)
+- [Environment Variables](#environment-variables)
+- [Semantic analysis and isolation](#semantic-analysis-and-isolation)
+- [Generic types and framework adapters](#generic-types-and-framework-adapters)
+- [Project detection and language level](#project-detection-and-language-level)
+- [Field-lineage semantic contract](#field-lineage-semantic-contract)
+- [External classpath](#external-classpath)
+- [Index location](#index-location)
+- [Output](#output)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Release](#release)
+- [License](#license)
+
+## Get Started
+
+### 1. Install
 
 ```bash
 npm install -g field-trace-graph
-ftg --version
 ```
 
-Node.js 18 or newer is required. No JDK is needed: each archive ships its own
-runtime.
-
+Node.js 18 or newer; no JDK is required, each release bundles its own runtime.
 The package installs two names for the same command, `field-trace-graph` and the
-short `ftg`; the examples in this document use `ftg`.
+short `ftg` — the examples below use `ftg`.
 
-On first use the launcher picks the archive for the current OS/CPU from the
-bundled `release-manifest.json`, downloads it from the HTTPS release base URL,
-verifies its SHA-256, extracts it under `~/.field-trace-graph/dist/<version>`,
-and then forwards arguments, signals, and exit codes to that executable. Later
-runs reuse the cache and do not touch the network.
-
-Supported targets: `darwin-arm64`, `darwin-x64`, `linux-x64`, `win32-x64`.
+On first run the launcher resolves the archive for your OS/CPU from the bundled
+release manifest, verifies its SHA-256, extracts it under
+`~/.field-trace-graph/dist/<version>`, and forwards arguments, signals, and exit
+codes to that executable. The first download is about 200 MB; later runs reuse
+the cache and start in under a second.
 
 ```bash
-# Pin a version, which is what CI should do.
+# Pin a version (what CI should do), or upgrade and remove.
 npm install -g field-trace-graph@0.1.0
-
-# Upgrade or remove.
 npm install -g field-trace-graph@latest
 npm uninstall -g field-trace-graph
 
-# Drop the downloaded archives and runtimes; they are fetched again on demand.
+# Drop downloaded archives and runtimes; they are fetched again on demand.
 rm -rf ~/.field-trace-graph/dist
 ```
 
-### Without npm
+<details>
+<summary><b>Without npm — platform archive or a local JAR</b></summary>
 
 Air-gapped machines and release debugging can skip the launcher entirely:
 
 ```bash
-# Use a published platform archive: no JDK and no Node.js are needed.
+# Published archive: no JDK and no Node.js are needed after extraction.
 tar -xzf field-trace-graph-0.1.0-linux-x64.tar.gz
 ./bin/ftg --version
 
-# Or build the shaded JAR and run it with a local JDK (see Build).
+# Or build the shaded JAR and run it with a local JDK (see Development).
 java -jar lineage-cli/target/field-trace-graph.jar --version
 ```
 
+</details>
 
-
-## Build
-
-```bash
-export JAVA_HOME=/path/to/jdk-17-or-21
-mvn clean package
-```
-
-The shaded executable jar is `lineage-cli/target/field-trace-graph.jar`.
-
-For a local JAR build, run it from any project root or pass `--project`:
+### 2. Index a project
 
 ```bash
-cd /path/to/java-project
-java -jar /path/to/field-trace-graph.jar init
-java -jar /path/to/field-trace-graph.jar methods --name OrderService
-java -jar /path/to/field-trace-graph.jar trace \
-  --method 'com.example.OrderService#create(String,String)' \
-  --target result.status
-```
-
-For shorter commands, create an alias in the current shell:
-
-```bash
-alias ftg='java -jar /path/to/field-trace-graph.jar'
+cd your-java-project
 ftg init
 ```
 
-## Modules
+`init` builds the complete graph in one pass and writes it to
+`.field-trace-graph/trace.db` inside the project. It never uploads source code.
 
-- `lineage-core`: domain model, query rules, ports, and JDK-only shared utilities.
-- `lineage-java`: Java AST extraction, type/call resolution, and semantic analysis.
-- `lineage-storage-sqlite`: SQLite schema, SQL, row mapping, and transactions.
-- `lineage-cli`: command controllers, application services, views, and assembly.
-- `distribution/npm`: thin Node launcher for a global install.
-
-## Build A Release
-
-Build a local archive with a bundled runtime:
-
-```bash
-export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
-FTG_STRICT_RELEASE=1 VERSION=0.1.0 OS=darwin CPU=arm64 distribution/build-release.sh
-```
-
-The archive contains `bin/`, `lib/`, `runtime/`, `licenses/`, the CycloneDX SBOM,
-and `.version`. Its SHA-256 is written to `distribution/release-manifest.json`.
-Set `FTG_BUNDLE_RUNTIME=0` only for local debugging; strict release builds require
-the bundled runtime.
-
-Run the fail-closed release gate before publishing:
-
-```bash
-FTG_VERIFY_PLATFORM_ONLY=darwin-arm64 distribution/verify-release.sh
-```
-
-`verify-release.sh` checks the license, npm license metadata, HTTPS download
-base, archive hashes, archive layout, bundled runtime, runtime/third-party
-licenses, SBOM, secret scan, and generated source/npm/archive SBOMs. See
-`To-do/RELEASE-CHECKLIST.md` for the external ownership, hosting, and signing inputs
-that cannot be inferred from source code.
-
-## Quick Start
+### 3. Trace a field
 
 Run the commands from the Java project being analyzed. If the current directory
 is not the project root, pass `--project /path/to/project`.
 
 ```bash
-# Install once, then run from any project.
-npm install -g field-trace-graph
-
-# Index the whole project once.
-cd /path/to/java-project
-ftg init
-
 # Find a method. The output contains the signature to copy into the next command.
 ftg methods --name OrderService
 
@@ -154,6 +123,48 @@ ftg trace \
 
 Every command prints text by default; add `--format json` for a single JSON
 object on stdout. Progress and logs always go to stderr.
+
+## Why field-trace-graph?
+
+Grep tells you where a name appears. It does not tell you how a value actually
+reaches a field — through getters and setters, builders, BeanCopy, MapStruct,
+streams, MyBatis parameter bridging, or a helper two calls away. Reconstructing
+that by hand means opening file after file and re-deriving the same paths every
+time.
+
+`ftg` builds the graph once and answers directly: given a method and a target
+expression, it returns the field-level edges in both directions, each carrying
+the file and line that produced it, plus an explicit boundary when resolution
+stops. Every hop is either evidence-backed (`EXACT_STATIC`) or clearly marked as
+a candidate, so you can see why a conclusion was reached instead of trusting a
+black box.
+
+Everything runs locally against a SQLite index in the project — no server, no
+network call, no source upload.
+
+## Key features
+
+| | |
+|---|---|
+| **Field-level lineage** | Traces individual fields and access paths (`result.status`, `goodTabCoupons[*].coupons`), not just method calls |
+| **Bidirectional** | `--direction in` asks who writes a value, `out` asks where it flows, `both` joins the two at the target |
+| **Evidence per edge** | Every edge records `fileId`, line/column range, resolution kind, and provenance; `ftg source` reprints the exact lines |
+| **Explicit boundaries** | Unresolved flows end at a named reason (`CLASSPATH_MISSING`, `GENERATED_CODE_MISSING`, `RPC_BOUNDARY`, …) with a suggested next action instead of a silent gap |
+| **Quality gates for CI** | `--fail-on-candidate`, `--fail-on-reason`, `--fail-on-boundary-density`, `--max-weak-hops` return exit code `6` when the graph is too weak |
+| **Stable JSON output** | `--format json` emits one versioned object on stdout; logs and progress always go to stderr |
+| **Framework-aware** | JavaParser-based extraction covers streams, builders, BeanCopy, MapStruct, Lombok-generated members, MyBatis Mapper XML, and constructor/super bindings |
+| **100% local** | SQLite index in `.field-trace-graph/trace.db`; nothing leaves the machine |
+
+## Supported platforms
+
+| Platform | Architecture | Archive |
+|---|---|---|
+| macOS | arm64 | `field-trace-graph-<version>-darwin-arm64.tar.gz` |
+| macOS | x64 | `field-trace-graph-<version>-darwin-x64.tar.gz` |
+| Linux | x64 | `field-trace-graph-<version>-linux-x64.tar.gz` |
+| Windows | x64 | `field-trace-graph-<version>-win32-x64.zip` |
+
+Each archive bundles a JDK 17 runtime, so end users install no JDK.
 
 ## Command Reference
 
@@ -628,165 +639,6 @@ whether the project index file exists. It does not create or update an index.
 | `--project PATH` | Current detected root | Project whose index presence is checked. |
 | `--format text / json` | `text` | Result output format. |
 
-## Development Commands
-
-These commands operate on this repository, not on the Java project being
-analyzed.
-
-```bash
-# Compile all modules and build the executable JAR.
-mvn clean package
-mvn -q clean package
-```
-
-This repository does not ship unit tests or a regression harness, so
-`mvn test` has nothing to run. Build with `mvn clean package`.
-
-If the local Maven cache was populated by a different Maven installation, or
-the machine is offline, Maven may warn that an artifact was "cached from a
-remote repository ID that is unavailable in current build context". The
-artifacts are already present, so build offline or disable local-repository
-tracking:
-
-```bash
-mvn -o clean package     # air-gapped build against a complete local cache
-mvn -llr clean package   # legacy local repository, ignores cached repo IDs
-```
-
-The shaded executable is `lineage-cli/target/field-trace-graph.jar`. The
-individual module JARs are build artifacts and are not the normal command-line
-entry point.
-
-## Diagnostic Commands
-
-The local graph is SQLite and is safe to inspect directly. These commands are
-read-only:
-
-```bash
-# List tables.
-sqlite3 .field-trace-graph/trace.db ".tables"
-
-# Show one published index state and table counts.
-sqlite3 .field-trace-graph/trace.db <<'SQL'
-SELECT 'files', COUNT(*) FROM source_file
-UNION ALL SELECT 'symbols', COUNT(*) FROM source_code_symbol
-UNION ALL SELECT 'nodes', COUNT(*) FROM value_node
-UNION ALL SELECT 'edges', COUNT(*) FROM value_data_edge
-UNION ALL SELECT 'call_edges', COUNT(*) FROM parsed_invoke_edge
-UNION ALL SELECT 'method_summaries', COUNT(*) FROM method_summary
-UNION ALL SELECT 'pending_refs', COUNT(*) FROM pending_parse_invoke_ref;
-
-SELECT active_generation, graph_status, published_at,
-       last_attempt_status, last_error_code
-FROM full_index_state;
-SQL
-```
-
-Useful checks:
-
-- `files` should match the expected main Java source count when tests are
-  excluded.
-- `status` is the easiest way to check whether the latest generation is
-  `READY`, `PARTIAL`, or stale.
-- `doctor` distinguishes a missing runtime/compiler from a missing index.
-
-### Index counters and symbol dimensions
-
-`ftg status` reports the counters below. They are the authoritative check that a
-published generation covers the source tree you expect.
-
-`parsed_invoke_edge` stores only calls that reached a callee (`EXACT_STATIC`,
-`COMPILE_TIME_TARGET`, `VIRTUAL_UNIQUE`, `CANDIDATE`). Unresolved calls are
-recorded once, in `pending_parse_invoke_ref`, together with the call-site payload
-(dispatch kind, receiver, arguments, result value) needed to keep
-receiver-to-result bridges during traversal. The two tables are therefore
-disjoint and their counts can be compared with tools that separate pending
-references. `ftg status` prints both numbers as `calls=` and `pending=`.
-
-Symbol comparison uses separate dimensions instead of one `kind` column:
-
-```text
-declaration kind: CLASS / INTERFACE / ENUM / RECORD / ANNOTATION /
-                  METHOD / CONSTRUCTOR / INITIALIZER
-symbol role:      BUSINESS / ACCESSOR_GET / ACCESSOR_SET / INITIALIZER
-```
-
-Use these FTG counters for comparison:
-
-```sql
-SELECT
-    COUNT(*) AS total_symbols,
-    SUM(kind IN ('CLASS','INTERFACE','ENUM','RECORD','ANNOTATION')) AS type_count,
-    SUM(kind = 'METHOD') AS method_count,
-    SUM(kind = 'METHOD' AND symbol_role = 'BUSINESS') AS business_method_count,
-    SUM(symbol_role IN ('ACCESSOR_GET','ACCESSOR_SET')) AS accessor_count,
-    SUM(kind = 'CONSTRUCTOR') AS constructor_count,
-    SUM(symbol_role = 'INITIALIZER') AS initializer_count
-FROM source_code_symbol;
-```
-
-For a stable row-level key, use the declaration tuple rather than the numeric
-symbol IDs:
-
-```text
-relative file path
-+ declaring type fully-qualified name
-+ method or constructor name
-+ normalized parameter types
-+ constructor flag
-```
-
-The branch and commit must match before interpreting a remaining difference as
-a regression.
-
-## Release Commands
-
-The release scripts are for maintainers and require the ownership, license,
-hosting, and signing inputs listed in `To-do/RELEASE-CHECKLIST.md`.
-
-```bash
-# Build one platform archive with a bundled runtime.
-export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
-FTG_STRICT_RELEASE=1 VERSION=0.1.0 OS=darwin CPU=arm64 \
-  distribution/build-release.sh
-
-# Run the fail-closed archive and manifest verification gate.
-FTG_VERIFY_PLATFORM_ONLY=darwin-arm64 distribution/verify-release.sh
-
-# Smoke-test the unpacked archive with its bundled runtime.
-distribution/smoke-test-release.sh \
-  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
-
-# Build the npm tarball, install it into a temp prefix, and exercise the launcher.
-distribution/smoke-test-npm.sh \
-  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
-
-# Run the source, npm tarball, and archive secret/SBOM scan.
-distribution/security-scan.sh
-
-# Build and smoke-test the npm launcher locally.
-cd distribution/npm
-npm pack
-npm install -g ./field-trace-graph-0.1.0.tgz
-field-trace-graph --version
-field-trace-graph doctor
-```
-
-Internal release helpers:
-
-```bash
-# Copy the root release manifest into the npm package when packing.
-node distribution/npm/scripts/sync-manifest.js
-
-# Update one platform entry after an archive is built.
-node distribution/update-release-manifest.js \
-  darwin arm64 field-trace-graph-0.1.0-darwin-arm64.tar.gz "$SHA256"
-```
-
-The build script calls the manifest updater automatically. `npm pack` runs
-`sync-manifest.js` through the package `prepack` script. `verify-release.sh`
-calls `security-scan.sh` unless `FTG_SKIP_SECURITY_SCAN=1` is explicitly set.
-
 ## Environment Variables
 
 Runtime size and timeout budgets can be overridden without editing the
@@ -939,3 +791,282 @@ The tool does not modify source files.
 Pass `--format json` for a single JSON object on stdout. Logs and progress go to
 stderr. Exit codes: `0` success, `2` usage/not-found, `3` stale or missing index,
 `4` internal/parse/storage error, `5` resource budget.
+
+## Troubleshooting
+
+**First run looks frozen** — it is downloading the platform archive (~200 MB).
+The launcher writes `downloading <archive> (<size>)...` and
+`downloaded <archive> (<size>) in Ns` to stderr; later runs start in under a
+second.
+
+**`init` hangs** — you are probably indexing a directory that is not a project
+root (running it in `~` walks your entire home directory). Run it inside the
+project, or pass `--project /path/to/project`.
+
+**`ftg` and `field-trace-graph` behave differently** — they cannot: both are
+symlinks to the same launcher. Run `type -a ftg`; an older shell alias will
+shadow the installed command.
+
+**Results look stale after editing code** — `init` and `index` refresh the
+graph. Use `--no-sync` only when you deliberately want to read the existing
+index.
+
+**Getter/setter flows stop early on Lombok classes** — generated members are not
+in the source. Produce delombok output and pass `--generated-sources <dir>` so
+those accesses resolve.
+
+**A trace ends at `CLASSPATH_MISSING`** — the receiver type is named in source
+but no classpath entry confirms its members. Pass `--classpath` (or a
+`--classpath-file`) pointing at the module's output directory or dependency JARs.
+
+**`database is locked` or a corrupted cache** — remove
+`~/.field-trace-graph/dist/` (launcher) and `.field-trace-graph/` (index); the
+next run rebuilds both.
+
+**Index is unexpectedly large** — check that `target/`, `build/`, and generated
+directories are covered by `.gitignore`, and that generated source roots are
+passed explicitly with `--generated-sources` instead of being indexed as regular
+source.
+
+## Development
+
+### Requirements
+
+- Published npm package: Node.js 18 or newer. No system JDK is required.
+- Build from source: JDK 17 or 21 with `javac`, Maven, and Node.js 18 or newer.
+- Release build: a redistributable JDK 17 or 21 selected with `FTG_RUNTIME_HOME`.
+
+### Build
+
+```bash
+export JAVA_HOME=/path/to/jdk-17-or-21
+mvn clean package
+```
+
+The shaded executable jar is `lineage-cli/target/field-trace-graph.jar`.
+
+For a local JAR build, run it from any project root or pass `--project`:
+
+```bash
+cd /path/to/java-project
+java -jar /path/to/field-trace-graph.jar init
+java -jar /path/to/field-trace-graph.jar methods --name OrderService
+java -jar /path/to/field-trace-graph.jar trace \
+  --method 'com.example.OrderService#create(String,String)' \
+  --target result.status
+```
+
+For shorter commands, create an alias in the current shell:
+
+```bash
+alias ftg='java -jar /path/to/field-trace-graph.jar'
+ftg init
+```
+
+### Modules
+
+- `lineage-core`: domain model, query rules, ports, and JDK-only shared utilities.
+- `lineage-java`: Java AST extraction, type/call resolution, and semantic analysis.
+- `lineage-storage-sqlite`: SQLite schema, SQL, row mapping, and transactions.
+- `lineage-cli`: command controllers, application services, views, and assembly.
+- `distribution/npm`: thin Node launcher for a global install.
+
+### Development Commands
+
+These commands operate on this repository, not on the Java project being
+analyzed.
+
+```bash
+# Compile all modules and build the executable JAR.
+mvn clean package
+mvn -q clean package
+```
+
+This repository does not ship unit tests or a regression harness, so
+`mvn test` has nothing to run. Build with `mvn clean package`.
+
+If the local Maven cache was populated by a different Maven installation, or
+the machine is offline, Maven may warn that an artifact was "cached from a
+remote repository ID that is unavailable in current build context". The
+artifacts are already present, so build offline or disable local-repository
+tracking:
+
+```bash
+mvn -o clean package     # air-gapped build against a complete local cache
+mvn -llr clean package   # legacy local repository, ignores cached repo IDs
+```
+
+The shaded executable is `lineage-cli/target/field-trace-graph.jar`. The
+individual module JARs are build artifacts and are not the normal command-line
+entry point.
+
+### Diagnostic Commands
+
+The local graph is SQLite and is safe to inspect directly. These commands are
+read-only:
+
+```bash
+# List tables.
+sqlite3 .field-trace-graph/trace.db ".tables"
+
+# Show one published index state and table counts.
+sqlite3 .field-trace-graph/trace.db <<'SQL'
+SELECT 'files', COUNT(*) FROM source_file
+UNION ALL SELECT 'symbols', COUNT(*) FROM source_code_symbol
+UNION ALL SELECT 'nodes', COUNT(*) FROM value_node
+UNION ALL SELECT 'edges', COUNT(*) FROM value_data_edge
+UNION ALL SELECT 'call_edges', COUNT(*) FROM parsed_invoke_edge
+UNION ALL SELECT 'method_summaries', COUNT(*) FROM method_summary
+UNION ALL SELECT 'pending_refs', COUNT(*) FROM pending_parse_invoke_ref;
+
+SELECT active_generation, graph_status, published_at,
+       last_attempt_status, last_error_code
+FROM full_index_state;
+SQL
+```
+
+Useful checks:
+
+- `files` should match the expected main Java source count when tests are
+  excluded.
+- `status` is the easiest way to check whether the latest generation is
+  `READY`, `PARTIAL`, or stale.
+- `doctor` distinguishes a missing runtime/compiler from a missing index.
+
+#### Index counters and symbol dimensions
+
+`ftg status` reports the counters below. They are the authoritative check that a
+published generation covers the source tree you expect.
+
+`parsed_invoke_edge` stores only calls that reached a callee (`EXACT_STATIC`,
+`COMPILE_TIME_TARGET`, `VIRTUAL_UNIQUE`, `CANDIDATE`). Unresolved calls are
+recorded once, in `pending_parse_invoke_ref`, together with the call-site payload
+(dispatch kind, receiver, arguments, result value) needed to keep
+receiver-to-result bridges during traversal. The two tables are therefore
+disjoint and their counts can be compared with tools that separate pending
+references. `ftg status` prints both numbers as `calls=` and `pending=`.
+
+Symbol comparison uses separate dimensions instead of one `kind` column:
+
+```text
+declaration kind: CLASS / INTERFACE / ENUM / RECORD / ANNOTATION /
+                  METHOD / CONSTRUCTOR / INITIALIZER
+symbol role:      BUSINESS / ACCESSOR_GET / ACCESSOR_SET / INITIALIZER
+```
+
+Use these FTG counters for comparison:
+
+```sql
+SELECT
+    COUNT(*) AS total_symbols,
+    SUM(kind IN ('CLASS','INTERFACE','ENUM','RECORD','ANNOTATION')) AS type_count,
+    SUM(kind = 'METHOD') AS method_count,
+    SUM(kind = 'METHOD' AND symbol_role = 'BUSINESS') AS business_method_count,
+    SUM(symbol_role IN ('ACCESSOR_GET','ACCESSOR_SET')) AS accessor_count,
+    SUM(kind = 'CONSTRUCTOR') AS constructor_count,
+    SUM(symbol_role = 'INITIALIZER') AS initializer_count
+FROM source_code_symbol;
+```
+
+For a stable row-level key, use the declaration tuple rather than the numeric
+symbol IDs:
+
+```text
+relative file path
++ declaring type fully-qualified name
++ method or constructor name
++ normalized parameter types
++ constructor flag
+```
+
+The branch and commit must match before interpreting a remaining difference as
+a regression.
+
+## Release
+
+### Build A Release
+
+Build a local archive with a bundled runtime:
+
+```bash
+export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
+FTG_STRICT_RELEASE=1 VERSION=0.1.0 OS=darwin CPU=arm64 distribution/build-release.sh
+```
+
+The archive contains `bin/`, `lib/`, `runtime/`, `licenses/`, the CycloneDX SBOM,
+and `.version`. Its SHA-256 is written to `distribution/release-manifest.json`.
+Set `FTG_BUNDLE_RUNTIME=0` only for local debugging; strict release builds require
+the bundled runtime.
+
+Run the fail-closed release gate before publishing:
+
+```bash
+FTG_VERIFY_PLATFORM_ONLY=darwin-arm64 distribution/verify-release.sh
+```
+
+`verify-release.sh` checks the license, npm license metadata, HTTPS download
+base, archive hashes, archive layout, bundled runtime, runtime/third-party
+licenses, SBOM, secret scan, and generated source/npm/archive SBOMs. See
+`To-do/RELEASE-CHECKLIST.md` for the external ownership, hosting, and signing inputs
+that cannot be inferred from source code.
+
+### Release Commands
+
+The release scripts are for maintainers and require the ownership, license,
+hosting, and signing inputs listed in `To-do/RELEASE-CHECKLIST.md`.
+
+```bash
+# Build one platform archive with a bundled runtime.
+export FTG_RUNTIME_HOME=/path/to/redistributable-jdk-17-or-21
+FTG_STRICT_RELEASE=1 VERSION=0.1.0 OS=darwin CPU=arm64 \
+  distribution/build-release.sh
+
+# Run the fail-closed archive and manifest verification gate.
+FTG_VERIFY_PLATFORM_ONLY=darwin-arm64 distribution/verify-release.sh
+
+# Smoke-test the unpacked archive with its bundled runtime.
+distribution/smoke-test-release.sh \
+  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
+
+# Build the npm tarball, install it into a temp prefix, and exercise the launcher.
+distribution/smoke-test-npm.sh \
+  distribution/build/field-trace-graph-0.1.0-darwin-arm64.tar.gz
+
+# Run the source, npm tarball, and archive secret/SBOM scan.
+distribution/security-scan.sh
+
+# Build and smoke-test the npm launcher locally.
+cd distribution/npm
+npm pack
+npm install -g ./field-trace-graph-0.1.0.tgz
+field-trace-graph --version
+field-trace-graph doctor
+```
+
+Internal release helpers:
+
+```bash
+# Copy the root release manifest into the npm package when packing.
+node distribution/npm/scripts/sync-manifest.js
+
+# Update one platform entry after an archive is built.
+node distribution/update-release-manifest.js \
+  darwin arm64 field-trace-graph-0.1.0-darwin-arm64.tar.gz "$SHA256"
+```
+
+The build script calls the manifest updater automatically. `npm pack` runs
+`sync-manifest.js` through the package `prepack` script. `verify-release.sh`
+calls `security-scan.sh` unless `FTG_SKIP_SECURITY_SCAN=1` is explicitly set.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+<div align="center">
+
+**Local Java field lineage — no server, no upload, no model.**
+
+[Report a bug](https://github.com/rycan-top/field-trace-graph/issues) ·
+[Request a feature](https://github.com/rycan-top/field-trace-graph/issues)
+
+</div>
