@@ -14,7 +14,7 @@ esac
 
 CPU="${CPU:-$(uname -m)}"
 case "$CPU" in
-  x86_64|amd64) CPU=x64 ;;
+  x86_64|amd64|x64) CPU=x64 ;;
   arm64|aarch64) CPU=arm64 ;;
   *) echo "Unsupported CPU for local release build: $CPU" >&2; exit 1 ;;
 esac
