@@ -53,12 +53,12 @@ Node.js 18 or newer; no JDK is required, each release bundles its own runtime.
 The package installs two names for the same command, `field-trace-graph` and the
 short `ftg` — the examples below use `ftg`.
 
-On first run the launcher resolves the archive for your OS/CPU from the bundled
-release manifest, verifies its SHA-256, extracts it under
-`~/.field-trace-graph/dist/<version>`, and forwards arguments, signals, and exit
-codes to that executable. The first download is about 200 MB; later runs reuse
-the cache and start in under a second.
-
+On first run — including a bare `ftg --version`, because the launcher needs the
+release before it can forward anything — the launcher resolves the archive for
+your OS/CPU from the bundled release manifest, verifies its SHA-256, extracts it
+under `~/.field-trace-graph/dist/<version>`, and forwards arguments, signals,
+and exit codes to that executable. The first download is about 200 MB; later
+runs reuse the cache and start in under a second.
 ```bash
 # Pin a version (what CI should do), or upgrade and remove.
 npm install -g field-trace-graph@0.1.0
@@ -795,6 +795,7 @@ stderr. Exit codes: `0` success, `2` usage/not-found, `3` stale or missing index
 ## Troubleshooting
 
 **First run looks frozen** — it is downloading the platform archive (~200 MB).
+This happens on the first invocation of any command, `--version` included.
 The launcher writes `downloading <archive> (<size>)...` and
 `downloaded <archive> (<size>) in Ns` to stderr; later runs start in under a
 second.
