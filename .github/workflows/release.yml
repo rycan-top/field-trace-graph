@@ -40,7 +40,7 @@ jobs:
           # current x86_64 macOS runner label.
           - { os: darwin, cpu: x64, runner: macos-15-intel }
           - { os: linux, cpu: x64, runner: ubuntu-latest }
-          - { os: win32, cpu: x64, runner: wƒindows-latest }
+          - { os: win32, cpu: x64, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
 
