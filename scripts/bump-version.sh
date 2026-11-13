@@ -41,9 +41,12 @@ if [ -z "$OLD_VERSION" ]; then
   echo "root pom.xml has no <revision> property" >&2
   exit 1
 fi
+SAME_VERSION=0
 if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
-  echo "version is already $NEW_VERSION"
-  exit 0
+  # 不早退：POM 可能已经提升而 manifest / npm 包仍停在旧版本（一次只做了一半的
+  # 版本升级），继续执行才能把其余版本来源补齐并通过一致性校验。
+  echo "pom.xml revision is already $NEW_VERSION; re-syncing dependent sources"
+  SAME_VERSION=1
 fi
 
 node - "$ROOT/pom.xml" "$NEW_VERSION" <<'NODE'
@@ -144,5 +147,9 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git diff --check
 fi
 
-echo "bumped $OLD_VERSION -> $NEW_VERSION"
+if [ "$SAME_VERSION" = 1 ]; then
+  echo "version sources synced at $NEW_VERSION"
+else
+  echo "bumped $OLD_VERSION -> $NEW_VERSION"
+fi
 git diff --stat -- pom.xml distribution/release-manifest.json distribution/npm/package.json distribution/npm/release-manifest.json
