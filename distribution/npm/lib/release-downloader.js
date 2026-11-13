@@ -146,6 +146,7 @@ function fetch(url, entry, destination, redirects) {
       const expectedText = formatBytes(expectedBytes);
       const startedAt = Date.now();
       let lastReportAt = startedAt;
+      let progressWidth = 0;
       note(`downloading ${entry.archive}${expectedText ? ` (${expectedText})` : ''}...`);
       progressShown = true;
 
@@ -163,8 +164,10 @@ function fetch(url, entry, destination, redirects) {
             && Date.now() - lastReportAt >= PROGRESS_INTERVAL_MILLIS) {
           lastReportAt = Date.now();
           const percent = Math.min(100, Math.floor((totalBytes / expectedBytes) * 100));
-          process.stderr.write(`\rfield-trace-graph: downloading ${entry.archive} ${percent}% `
-            + `(${formatBytes(totalBytes)} / ${expectedText})`);
+          const line = `  ${percent}% (${formatBytes(totalBytes)} / ${expectedText})`;
+          const padding = ' '.repeat(Math.max(0, progressWidth - line.length));
+          progressWidth = line.length;
+          process.stderr.write(`\r${line}${padding}`);
         }
       });
       response.pipe(output);
