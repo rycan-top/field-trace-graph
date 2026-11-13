@@ -10,6 +10,54 @@ upload, no model, no background process.
 - Build from source: JDK 17 or 21 with `javac`, Maven, and Node.js 18 or newer.
 - Release build: a redistributable JDK 17 or 21 selected with `FTG_RUNTIME_HOME`.
 
+## Install
+
+```bash
+npm install -g field-trace-graph
+ftg --version
+```
+
+Node.js 18 or newer is required. No JDK is needed: each archive ships its own
+runtime.
+
+The package installs two names for the same command, `field-trace-graph` and the
+short `ftg`; the examples in this document use `ftg`.
+
+On first use the launcher picks the archive for the current OS/CPU from the
+bundled `release-manifest.json`, downloads it from the HTTPS release base URL,
+verifies its SHA-256, extracts it under `~/.field-trace-graph/dist/<version>`,
+and then forwards arguments, signals, and exit codes to that executable. Later
+runs reuse the cache and do not touch the network.
+
+Supported targets: `darwin-arm64`, `darwin-x64`, `linux-x64`, `win32-x64`.
+
+```bash
+# Pin a version, which is what CI should do.
+npm install -g field-trace-graph@0.1.0
+
+# Upgrade or remove.
+npm install -g field-trace-graph@latest
+npm uninstall -g field-trace-graph
+
+# Drop the downloaded archives and runtimes; they are fetched again on demand.
+rm -rf ~/.field-trace-graph/dist
+```
+
+### Without npm
+
+Air-gapped machines and release debugging can skip the launcher entirely:
+
+```bash
+# Use a published platform archive: no JDK and no Node.js are needed.
+tar -xzf field-trace-graph-0.1.0-linux-x64.tar.gz
+./bin/ftg --version
+
+# Or build the shaded JAR and run it with a local JDK (see Build).
+java -jar lineage-cli/target/field-trace-graph.jar --version
+```
+
+
+
 ## Build
 
 ```bash
@@ -45,44 +93,6 @@ ftg init
 - `lineage-cli`: command controllers, application services, views, and assembly.
 - `distribution/npm`: thin Node launcher for a global install.
 
-## Install
-
-This is a local command-line installer in the same usage model as CodeGraph:
-
-```bash
-npm install -g field-trace-graph
-field-trace-graph --version
-ftg --version
-```
-
-The npm package is a thin launcher. On first use it downloads the archive for
-the current OS/CPU from the release manifest, verifies its SHA-256, safely
-extracts it under `~/.field-trace-graph/dist/<version>`, and forwards arguments,
-signals, and exit codes to the executable in that local cache. The archive
-contains its own runtime, so end users do not install a JDK separately.
-
-The npm launcher is only usable after a real release manifest, an HTTPS archive
-base URL, and all platform archives have been published. Until then, use the
-local JAR or a locally built archive.
-
-For a local tarball test before the registry release:
-
-```bash
-cd distribution/npm
-npm pack
-npm install -g ./field-trace-graph-0.1.0.tgz
-```
-
-Update or remove a global installation with the standard npm commands:
-
-```bash
-npm install -g field-trace-graph@latest
-npm uninstall -g field-trace-graph
-```
-
-The npm package installs both `field-trace-graph` and the short `ftg` command.
-For a local JAR, `ftg` is a shell alias in the examples below.
-
 ## Build A Release
 
 Build a local archive with a bundled runtime:
@@ -115,12 +125,8 @@ Run the commands from the Java project being analyzed. If the current directory
 is not the project root, pass `--project /path/to/project`.
 
 ```bash
-# Build a local executable JAR from this repository.
-export JAVA_HOME=/path/to/jdk-17-or-21
-mvn -q clean package
-
-# Use a short local alias (npm installs both ftg and field-trace-graph).
-alias ftg='java -jar /path/to/FieldLineageGraph/lineage-cli/target/field-trace-graph.jar'
+# Install once, then run from any project.
+npm install -g field-trace-graph
 
 # Index the whole project once.
 cd /path/to/java-project
@@ -145,6 +151,9 @@ ftg trace \
   --direction both \
   --call-scope full
 ```
+
+Every command prints text by default; add `--format json` for a single JSON
+object on stdout. Progress and logs always go to stderr.
 
 ## Command Reference
 
