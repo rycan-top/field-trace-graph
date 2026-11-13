@@ -181,11 +181,44 @@ if [ "$OS" = "win32" ]; then
     (cd "$STAGE" && zip -qr "$OUT" .)
   elif command -v jar >/dev/null 2>&1; then
     # Windows runners do not always provide zip; the required JDK always
-    # provides a deterministic ZIP implementation.
-    jar --create --file "$OUT" -C "$STAGE" .
+    # provides a deterministic ZIP implementation. --no-manifest keeps the
+    # synthetic META-INF/MANIFEST.MF out of a non-JAR archive.
+    jar --create --no-manifest --file "$OUT" -C "$STAGE" .
   else
     echo "zip or a JDK jar tool is required to build a Windows archive." >&2
     exit 1
+  fi
+  # Windows ZIP writers store directory entries without the unix execute bit,
+  # which makes archive scanners such as syft fail with "permission denied"
+  # while extracting. Normalize entries to 0755/0644.
+  PYTHON_BIN="$(command -v python3 || command -v python || true)"
+  if [ -n "$PYTHON_BIN" ]; then
+    "$PYTHON_BIN" - "$OUT" <<'PYTHON'
+import os
+import shutil
+import sys
+import tempfile
+import zipfile
+
+archive = sys.argv[1]
+handle, temporary = tempfile.mkstemp(suffix=".zip")
+os.close(handle)
+with zipfile.ZipFile(archive) as source, zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as target:
+    for info in source.infolist():
+        name = info.filename
+        entry = zipfile.ZipInfo(name, date_time=info.date_time)
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        if name.endswith("/"):
+            entry.external_attr = (0o40755 << 16) | 0x10
+            target.writestr(entry, b"")
+        else:
+            entry.external_attr = 0o100644 << 16
+            with source.open(info) as stream, target.open(entry, "w") as output:
+                shutil.copyfileobj(stream, output, 1024 * 1024)
+os.replace(temporary, archive)
+PYTHON
+  else
+    echo "warning: python is unavailable; the Windows archive may not be scannable." >&2
   fi
 else
   LC_ALL=C tar -czf "$OUT" -C "$STAGE" .
