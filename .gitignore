@@ -37,3 +37,9 @@ security-reports/
 *.tgz
 node_modules/
 .npmrc
+
+
+### field-trace-graph local index ###
+.field-trace-graph/
+
+
