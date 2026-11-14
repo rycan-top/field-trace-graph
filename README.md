@@ -61,7 +61,7 @@ and exit codes to that executable. The first download is about 200 MB; later
 runs reuse the cache and start in under a second.
 ```bash
 # Pin a version (what CI should do), or upgrade and remove.
-npm install -g field-trace-graph@0.1.0
+npm install -g field-trace-graph
 npm install -g field-trace-graph@latest
 npm uninstall -g field-trace-graph
 
