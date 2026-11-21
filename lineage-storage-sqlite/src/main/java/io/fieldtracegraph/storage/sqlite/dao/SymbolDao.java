@@ -1,6 +1,7 @@
 package io.fieldtracegraph.storage.sqlite.dao;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.fieldtracegraph.core.model.AmbiguousMethodException;
 import io.fieldtracegraph.core.model.MethodCandidate;
 import io.fieldtracegraph.core.model.SymbolRecord;
 import io.fieldtracegraph.storage.sqlite.mapping.GraphRowMapper;
@@ -111,21 +112,42 @@ public final class SymbolDao {
         if (byId != null) {
             return byId;
         }
-        String signature = stripModulePrefix(selector);
+        int separator = selector.indexOf("::");
+        String module = separator < 0 ? null : selector.substring(0, separator);
+        String signature = separator < 0 ? selector : selector.substring(separator + 2);
         List<MethodCandidate> matches = findMethodBySignature(signature);
+        /*
+         * Monorepos routinely declare the same FQN in several modules (api vs
+         * impl, or a copied utility). Rejecting every such selector made 47.8%
+         * of one audited repository unusable. An explicit `module::signature`
+         * prefix narrows the candidate set deterministically; without it we at
+         * least prefer a candidate whose qname equals the selector exactly.
+         */
+        if (module != null && !module.isBlank()) {
+            List<MethodCandidate> inModule = matches.stream()
+                    .filter(candidate -> module.equals(candidate.moduleId()))
+                    .toList();
+            if (inModule.size() == 1) {
+                return inModule.get(0);
+            }
+            if (inModule.size() > 1) {
+                throw new AmbiguousMethodException(inModule);
+            }
+            return null;
+        }
         if (matches.size() == 1) {
             return matches.get(0);
         }
         if (matches.size() > 1) {
-            throw new IllegalArgumentException("METHOD_AMBIGUOUS");
+            List<MethodCandidate> exact = matches.stream()
+                    .filter(candidate -> candidate.methodQname().equals(signature))
+                    .toList();
+            if (exact.size() == 1) {
+                return exact.get(0);
+            }
+            throw new AmbiguousMethodException(matches);
         }
         return null;
-    }
-
-    // 作用：去掉选择器的模块前缀；逻辑：截取双冒号之后的部分，无前缀时原样返回。
-    private String stripModulePrefix(String selector) {
-        int separator = selector.indexOf("::");
-        return separator < 0 ? selector : selector.substring(separator + 2);
     }
 
     // 作用：按完整或简单签名查询方法；逻辑：同时匹配限定名与井号后的签名部分。

@@ -2,6 +2,8 @@ package io.fieldtracegraph.cli.config;
 
 import io.fieldtracegraph.cli.application.IndexReadinessService;
 import io.fieldtracegraph.cli.application.IndexStatusService;
+import io.fieldtracegraph.cli.application.BatchTraceService;
+import io.fieldtracegraph.cli.application.ClasspathResolutionService;
 import io.fieldtracegraph.cli.application.EvidenceImportService;
 import io.fieldtracegraph.cli.application.EvidenceDiffService;
 import io.fieldtracegraph.cli.application.LineageQueryService;
@@ -24,6 +26,8 @@ import io.fieldtracegraph.cli.controller.SourceCommand;
 import io.fieldtracegraph.cli.controller.StatusCommand;
 import io.fieldtracegraph.cli.controller.TargetsCommand;
 import io.fieldtracegraph.cli.controller.TraceCommand;
+import io.fieldtracegraph.cli.controller.TraceBatchCommand;
+import io.fieldtracegraph.cli.controller.ClasspathCommand;
 import io.fieldtracegraph.cli.error.CliExecutionExceptionHandler;
 import io.fieldtracegraph.cli.project.LocalProjectSourceReader;
 import io.fieldtracegraph.cli.project.ProjectRootResolver;
@@ -49,6 +53,8 @@ public final class LineageBeanConfiguration {
     private final MethodsCommand methodsCommand;
     private final TargetsCommand targetsCommand;
     private final TraceCommand traceCommand;
+    private final TraceBatchCommand traceBatchCommand;
+    private final ClasspathCommand classpathCommand;
     private final SourceCommand sourceCommand;
     private final DoctorCommand doctorCommand;
     private final EvidenceCommand evidenceCommand;
@@ -121,6 +127,13 @@ public final class LineageBeanConfiguration {
                 indexReadinessService,
                 lineageQueryService
         );
+        BatchTraceService batchTraceService = new BatchTraceService(
+                projectRootResolver,
+                indexReadinessService,
+                lineageQueryService
+        );
+        ClasspathResolutionService classpathResolutionService =
+                new ClasspathResolutionService(projectRootResolver);
         SourceEvidenceService sourceEvidenceService = new SourceEvidenceService(
                 projectRootResolver,
                 sourceReader,
@@ -134,6 +147,8 @@ public final class LineageBeanConfiguration {
         methodsCommand = new MethodsCommand(methodSearchService, resultView);
         targetsCommand = new TargetsCommand(targetDiscoveryService, resultView);
         traceCommand = new TraceCommand(traceApplicationService, resultView);
+        traceBatchCommand = new TraceBatchCommand(batchTraceService);
+        classpathCommand = new ClasspathCommand(classpathResolutionService, projectRootResolver);
         sourceCommand = new SourceCommand(sourceEvidenceService, resultView);
         doctorCommand = new DoctorCommand(runtimeDoctorService, resultView);
         evidenceCommand = new EvidenceCommand();
@@ -151,6 +166,8 @@ public final class LineageBeanConfiguration {
                 .addSubcommand(methodsCommand)
                 .addSubcommand(targetsCommand)
                 .addSubcommand(traceCommand)
+                .addSubcommand(traceBatchCommand)
+                .addSubcommand(classpathCommand)
                 .addSubcommand(sourceCommand)
                 .addSubcommand(doctorCommand)
                 .addSubcommand(evidenceCommand);

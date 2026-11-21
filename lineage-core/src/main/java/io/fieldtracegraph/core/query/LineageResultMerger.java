@@ -84,7 +84,9 @@ public final class LineageResultMerger {
             boolean includeIn,
             boolean includeOut
     ) {
+        long deadline = state.deadline;
         Set<ValueRef> usefulRefs = usefulRefs(index, state.visited, state.backwardVisited, target);
+        checkDeadline(deadline, "result merge");
         Set<String> usefulKeys = new HashSet<>();
         for (ValueRef ref : usefulRefs) {
             // Traversal contexts distinguish shared callees internally, while
@@ -95,10 +97,14 @@ public final class LineageResultMerger {
                 .filter(edge -> usefulKeys.contains(edge.srcId()) && usefulKeys.contains(edge.dstId()))
                 .toList();
         usefulEdges = dedupeEdges(pruneSymmetricBackflow(usefulEdges, target));
-        BoundaryProjection boundaryProjection = boundaries(index, usefulRefs, includeIn, includeOut);
-        List<SourceEvidence> sourceEvidence = evidence(index, usefulEdges);
+        checkDeadline(deadline, "result merge");
+        BoundaryProjection boundaryProjection = boundaries(
+                index, usefulRefs, includeIn, includeOut, deadline);
+        checkDeadline(deadline, "boundary projection");
+        List<SourceEvidence> sourceEvidence = evidence(index, usefulEdges, deadline);
         usefulEdges = operations(usefulEdges, sourceEvidence);
         LineageChainAssembler.ChainProjection chainProjection = chains(usefulEdges);
+        checkDeadline(deadline, "chain assembly");
         if (chainProjection.countLimitReached()) {
             state.markTruncated("CHAIN_COUNT_LIMIT");
         }
@@ -111,7 +117,7 @@ public final class LineageResultMerger {
                 index.generation(),
                 index.graphStatus(),
                 freshness,
-                nodes(index, usefulRefs),
+                nodes(index, usefulRefs, deadline),
                 usefulEdges,
                 chainProjection.chains(),
                 boundaryProjection.boundaries(),
@@ -121,7 +127,7 @@ public final class LineageResultMerger {
                 sourceEvidence,
                 fileIndexes(index, usefulEdges),
                 snapshotConsistent(index, usefulEdges),
-                noMatchReason(index, usefulEdges),
+                noMatchReason(index, usefulEdges, boundaryProjection.boundaries()),
                 evidenceIssues(index, usefulEdges, freshness),
                 state.truncated,
                 List.copyOf(state.truncationReasons),
@@ -423,9 +429,17 @@ public final class LineageResultMerger {
         visitedScopes.add(index.method().methodId());
         return weakHops.stream()
                 .filter(hop -> hop.callerSymbolId() == null || visitedScopes.contains(hop.callerSymbolId()))
-                .filter(hop -> evidenceLocations.isEmpty()
+                /*
+                 * A weak hop that consumes the traced value often has no
+                 * rendered edge at its line, so an evidence-location-only
+                 * filter silently dropped the very boundary that explains the
+                 * trace. Value contact is the stronger signal; fall back to
+                 * the evidence location only when the hop carries no value
+                 * reference.
+                 */
+                .filter(hop -> touchesTracedValue(hop, usefulNodeIds)
+                        || evidenceLocations.isEmpty()
                         || evidenceLocations.contains(hop.fileId() + ":" + hop.lineStart()))
-                .filter(hop -> touchesTracedValue(hop, usefulNodeIds))
                 .toList();
     }
 
@@ -453,10 +467,29 @@ public final class LineageResultMerger {
         return false;
     }
 
+    /*
+     * The merge phase runs after the traversals and used to ignore the query
+     * deadline. A single very wide call cone (thousands of chains) could then
+     * project boundaries for minutes past the timeout while the batch reported
+     * nothing. Every merge stage now honours the same deadline as the
+     * traversals, so a pathological case fails fast with TRACE_TIMEOUT instead
+     * of stalling the shard.
+     */
+    // 作用：检查合并阶段预算；逻辑：超过截止时间抛出可识别的超时异常。
+    private static void checkDeadline(long deadlineNanos, String phase) {
+        if (System.nanoTime() > deadlineNanos) {
+            throw new TraceTimeoutException(phase);
+        }
+    }
+
     // 作用：把访问引用转为输出节点；逻辑：逐个调用索引转换并保持顺序。
-    private List<TraceNode> nodes(LineageIndex index, Set<ValueRef> visited) {
+    private List<TraceNode> nodes(LineageIndex index, Set<ValueRef> visited, long deadlineNanos) {
         Map<String, TraceNode> unique = new LinkedHashMap<>();
+        int scanned = 0;
         for (ValueRef ref : visited) {
+            if ((++scanned & 0x3F) == 0) {
+                checkDeadline(deadlineNanos, "node projection");
+            }
             TraceNode node = index.toTraceNode(new ValueRef(ref.nodeId(), ref.fields()));
             unique.putIfAbsent(node.nodeId(), node);
         }
@@ -464,15 +497,25 @@ public final class LineageResultMerger {
     }
 
     // 作用：投影开放边界；逻辑：按方向收集边界证据并生成边界列表。
-    private BoundaryProjection boundaries(LineageIndex index, Set<ValueRef> visited, boolean includeIn, boolean includeOut) {
+    private BoundaryProjection boundaries(
+            LineageIndex index,
+            Set<ValueRef> visited,
+            boolean includeIn,
+            boolean includeOut,
+            long deadlineNanos
+    ) {
         Map<String, TraceBoundary> boundaries = new LinkedHashMap<>();
         Map<String, TraceLeaf> leaves = new LinkedHashMap<>();
+        int scanned = 0;
         for (ValueRef ref : visited) {
+            if ((++scanned & 0x3F) == 0) {
+                checkDeadline(deadlineNanos, "boundary projection");
+            }
             ValueNodeRecord node = index.node(ref.nodeId());
             if (node == null) {
                 continue;
             }
-            if (includeIn && index.incoming(ref).isEmpty()) {
+            if (includeIn && !index.hasIncoming(ref)) {
                 String reason = boundaryReason(index, ref, true);
                 String key = ValueRef.withoutCallContext(ref.key());
                 TraceBoundary boundary = boundary(index, ref, key, "IN", reason, false);
@@ -494,6 +537,25 @@ public final class LineageResultMerger {
                     // The object was passed through this method, but the
                     // method never accessed this field. It is not a lineage
                     // boundary of the field, only an unused parameter.
+                    continue;
+                }
+                if (ref.fields().isEmpty()
+                        && (node.accessPath() == null || node.accessPath().isEmpty())
+                        && index.hasFieldEvidence(node)) {
+                    /*
+                     * The object root is consumed through its fields. Reporting
+                     * the whole object as NO_CONSUMER would contradict the
+                     * concrete field reads that are already in this trace.
+                     */
+                    continue;
+                }
+                if (index.hasFieldDescendant(node, ref.fields())) {
+                    /*
+                     * A parent field such as pair.right is not terminal when
+                     * pair.right.price has concrete evidence. Reporting
+                     * NO_CONSUMER here would contradict the deeper field path
+                     * that is present in the same trace.
+                     */
                     continue;
                 }
                 String reason = boundaryReason(index, ref, false);
@@ -639,6 +701,18 @@ public final class LineageResultMerger {
                     "none",
                     evidenceSource
             );
+            case "CONDITION_USES" -> new BoundaryGuidance(
+                    "CONDITION_ONLY",
+                    true,
+                    "rerun-with-include-dependencies",
+                    evidenceSource
+            );
+            case "CONDITION_TERMINAL" -> new BoundaryGuidance(
+                    "CONDITION_TERMINAL",
+                    false,
+                    "none",
+                    evidenceSource
+            );
             case "FIELD" -> "IN".equals(direction)
                     ? new BoundaryGuidance(
                             "FIELD_STATE",
@@ -763,15 +837,23 @@ public final class LineageResultMerger {
     }
 
     // 作用：收集源码证据；逻辑：按证据 ID 去重并生成证据对象。
-    private List<SourceEvidence> evidence(LineageIndex index, List<TraceEdge> edges) {
+    private List<SourceEvidence> evidence(LineageIndex index, List<TraceEdge> edges, long deadlineNanos) {
         Map<String, SourceEvidence> unique = new LinkedHashMap<>();
+        int scanned = 0;
         for (TraceEdge edge : edges) {
+            if ((++scanned & 0x3F) == 0) {
+                checkDeadline(deadlineNanos, "source evidence");
+            }
             Step step = index.stepByEvidenceId(edge.evidenceId());
             if (step == null) {
                 continue;
             }
             SourceFileRecord file = index.file(step.fileId());
             if (file != null) {
+                String effectLocation = edge.effectLocation() == null
+                        || edge.effectLocation().isBlank()
+                        ? step.effectLocation()
+                        : edge.effectLocation();
                 unique.putIfAbsent(edge.evidenceId(), new SourceEvidence(
                         edge.evidenceId(),
                         file.relativePath(),
@@ -781,7 +863,7 @@ public final class LineageResultMerger {
                         step.lineEnd(),
                         step.columnEnd(),
                         sourceExpression(file, step),
-                        step.effectLocation()
+                        effectLocation
                 ));
             }
         }
@@ -931,8 +1013,17 @@ public final class LineageResultMerger {
     }
 
     // 作用：生成未命中原因；逻辑：根据边与索引状态推断具体原因。
-    private TraceNoMatchReason noMatchReason(LineageIndex index, List<TraceEdge> edges) {
+    private TraceNoMatchReason noMatchReason(
+            LineageIndex index,
+            List<TraceEdge> edges,
+            List<TraceBoundary> boundaries
+    ) {
         if (!edges.isEmpty()) {
+            return null;
+        }
+        boolean dependencyEvidence = boundaries.stream()
+                .anyMatch(boundary -> "CONDITION_USES".equals(boundary.reason()));
+        if (dependencyEvidence) {
             return null;
         }
         if (index.valueNodes().isEmpty()) {
@@ -941,9 +1032,23 @@ public final class LineageResultMerger {
                     "The method index exists but no value graph was published"
             );
         }
+        boolean externalAccessor = boundaries.stream().anyMatch(boundary ->
+                "FIELD".equals(boundary.kind())
+                        && ("CLASSPATH_MISSING".equals(boundary.reasonCode())
+                        || "EXTERNAL_LIBRARY".equals(boundary.reasonCode())));
+        if (externalAccessor) {
+            return new TraceNoMatchReason(
+                    "EXTERNAL_ACCESSOR_UNVERIFIED",
+                    "The accessor is read here, but the receiver type is outside the analysed "
+                            + "sources and the supplied classpath does not prove its field; "
+                            + "provide --classpath-file to continue the trace"
+            );
+        }
         return new TraceNoMatchReason(
                 "FIELD_HAS_NO_DATA_EDGES",
-                "The target exists but has no traceable data edge in this method"
+                "The target exists but has no traceable data edge in this method; "
+                        + "logging, monitoring and other non-lineage calls are excluded, "
+                        + "so a field used only in those calls has no data edge"
         );
     }
 
@@ -1000,7 +1105,11 @@ public final class LineageResultMerger {
             return "EXTERNAL";
         }
         String externalReason = index.externalReasonForValue(node.valueId());
-        if (externalReason != null) {
+        if (incoming && externalReason != null) {
+            /*
+             * Going upstream, the external accessor really is the end of the
+             * line: its internal field is not in the graph.
+             */
             return externalReason;
         }
         if (incoming
@@ -1017,6 +1126,26 @@ public final class LineageResultMerger {
              */
             return "USE_UNRESOLVED";
         }
+        if (!incoming && index.hasDependencyUse(node, ref.fields())) {
+            /*
+             * Dependency edges are not value flow, but a field used only in a
+             * condition is still consumed. This must win over CONSUMED_BY_CALL:
+             * an object root passed to a call does not prove that this
+             * particular field was consumed, while CONDITION_USES is direct
+             * evidence for the exact field path.
+             */
+            return "CONDITION_USES";
+        }
+        if (!incoming
+                && node.canonicalValue() != null
+                && node.canonicalValue().startsWith("branch:condition:")) {
+            /*
+             * A condition node is a control dependency sink, not a business
+             * value with consumers. Reporting NO_CONSUMER here would read as
+             * "unused" even though the branch depends on it.
+             */
+            return "CONDITION_TERMINAL";
+        }
         if (!incoming && index.hasCallConsumer(ref)) {
             /*
              * The value is passed to a call whose result does not expose this
@@ -1024,6 +1153,14 @@ public final class LineageResultMerger {
              * correct terminal state is "consumed by a call", not "unused".
              */
             return "CONSUMED_BY_CALL";
+        }
+        if (!incoming && externalReason != null) {
+            /*
+             * A proven consumer wins over the external boundary: `re.message`
+             * used in a condition is a control dependency even though the
+             * receiver type comes from a library.
+             */
+            return externalReason;
         }
         if ("PARAMETER".equals(node.valueKind())) {
             return "PARAMETER";

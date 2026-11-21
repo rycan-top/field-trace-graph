@@ -36,8 +36,28 @@ public final class SemanticContextFingerprint {
      * 0.5.4: exclude serializer calls nested in logging/diagnostic calls.
      * 0.5.5: bridge every source implementation of an abstract/RPC call and
      *        preserve object-valued property hand-offs.
+     * 0.5.6: keep getter-only control conditions as field evidence so fields
+     *        used solely in conditions can cross call-argument bridges.
+     * 0.5.7: expand Commons Pair factories into left/right component fields.
+     * 0.5.8: keep each Pair factory's field evidence scoped to its call site.
+     * 0.5.9: ignore business logger/monitoring utilities and numeric parse
+     *        conversions as diagnostic noise.
+     * 0.6.0: type/API-based Logger detection and arity-aware tuple factories
+     *        (Pair/Triple/TupleN/Map.entry) plus transparent value wrappers.
+     * 0.6.1: generic *Logger/*LogUtil name matching for wrapper log methods.
+     * 0.6.2: broaden Logger type matching and suppress empty collection
+     *        factories/container constructors from weak-hop accounting.
+     * 0.6.3: treat log-prefixed utility methods as logging sinks.
+     * 0.6.4: bridge Optional/CompletableFuture callbacks and terminal
+     *        wrapper methods to field paths; treat common *Utils calls as
+     *        transparent value conversions.
+     * 0.6.5: restrict wrapper terminal propagation to value-returning methods.
+     * 0.6.6: keep field operands of pure predicates (equals/contains/isEmpty)
+     *        in condition dependencies.
+     * 0.6.7: collect predicate arguments as well as the receiver, so
+     *        a.getCode().equals(b.getStatus()) exposes b.status.
      */
-    public static final String RULE_VERSION = "0.5.5";
+    public static final String RULE_VERSION = "0.6.7";
 
     // 作用：按显式 classpath 计算上下文指纹；逻辑：先把命令行条目纳入校验指纹，再转交核心计算。
     public String compute(

@@ -2,6 +2,8 @@
 
 # field-trace-graph
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 **Trace any Java field back to where it comes from — one command, fully local.**
 
 `ftg` builds a field-level lineage graph of a local Java project and answers
@@ -543,6 +545,27 @@ step from a raw ID. Call-result producer hops use `CALL_PRODUCER` and expose the
 receiver-to-result relationship, including external calls such as
 `paymentService.fetchMerchantConfig(...)`.
 
+Text output appends `at=<File.java>:<line>` to an edge whenever the statement
+that produced it sits on a different line than the destination node's version
+anchor. Whole-object copies (`COPY_ALL`), container element aggregates
+(`list[*]`) and callee-effect bridges keep their version anchor on the receiving
+variable, which is usually a declaration; `at=` names the exact copy, `add`/`put`
+or call line, so a reader can confirm both the value version and the operation
+that moved it. JSON already exposes the same position as `sourceFile` plus
+`lineStart`.
+
+For a field projected out of a container element (`list[*].field`), the
+`effect=` anchor follows the selected field node, not the element allocation.
+For example `msgList.add(dto)` reports `dto.setOwnerId(...)` as the effect when
+`dto.ownerId` is the selected field; only an element built outside the analysed
+source falls back to the insertion line.
+
+The `Evidence:` block prints `<path>:<line>:<column>:<endColumn>` followed by
+the exact source text at that position. Multi-line statements are collapsed to
+single spaces so the snippet stays comparable, and a callee-effect bridge adds a
+separate `effect=<File.java>:<line>` column instead of modifying the snippet;
+the printed expression therefore always reproduces the cited source text.
+
 Every edge also carries `category`:
 
 - `FIELD_VALUE`: field or value lineage.
@@ -723,6 +746,33 @@ as `resolution=CANDIDATE` with `provenance=FRAMEWORK_ADAPTER`; import a runtime
 trace to confirm the fields that were actually serialized. Serializer calls
 nested inside logging or telemetry calls are ignored, so
 `log.info("{}", JSON.toJSONString(bean))` does not create field-lineage edges.
+Logging is detected from the receiver's declared `Logger`/`Log` type, the
+common logging packages, and standard logger factory calls such as
+`LoggerFactory.getLogger(...)`. Vendor-specific monitoring utilities are not
+hard-coded as loggers; they remain ordinary call boundaries unless their
+declared type proves they are a logger. Wrapper utilities whose receiver name
+contains `Logger` and whose method name contains a log level (for example
+`AuditLogger.reportError`) are still treated as diagnostic sinks.
+
+Tuple factories are expanded by arity: Commons `Pair`/`Triple` expose
+`left`/`middle`/`right`, JavaTuples expose `value0..N`, and Reactor/Vavr
+`TupleN` expose both `tN` and `_N`. `Map.entry(k, v)` is modelled as
+`key`/`value`. Collection factories such as `List.of`, `ImmutableList.of`,
+`Lists.newArrayList`, and `Optional.of` keep element flow, while transparent
+wrappers (`Objects.requireNonNull`, `Optional.orElse`, `StringUtils.defaultIfNull`)
+preserve their inputs instead of becoming external boundaries.
+Empty collection factories and collection/map constructors are excluded from
+weak-hop accounting because they cannot consume a field value.
+
+`Optional` and `CompletableFuture` are single-value wrappers. Callback methods
+such as `map`, `flatMap`, `filter`, `thenApply`, `thenCompose`, and `handle`
+are projected onto concrete field paths, including method references
+(`Optional.map(Bean::getAddress)`). Terminal methods (`orElse`, `join`) and a
+direct `return` keep the same field path, so `bean.address.city` can be
+followed through the whole wrapper chain instead of stopping at the JDK call.
+Common pure utility owners (`StringUtils`, `CollectionUtils`, `ObjectUtils`,
+`NumberUtils`, `BooleanUtils`, `ArrayUtils`, `MapUtils`, `Objects`) are treated
+as transparent conversions rather than unresolved external calls.
 
 MyBatis mapper XML is discovered by namespace rather than a hard-coded
 `/mapper/` directory. Bind variables retain XML line/column metadata;
@@ -1135,3 +1185,223 @@ Apache License 2.0 — see [LICENSE](LICENSE).
 [Request a feature](https://github.com/rycan-top/field-trace-graph/issues)
 
 </div>
+
+
+
+
+## Why FTG?
+
+When an AI agent needs to understand a codebase, it usually discovers structure the
+slow way: grep, glob, read, one file at a time, rebuilding field paths and call
+chains by hand.
+
+FTG hands the agent the field-level graph it needs in one query. It is a pre-built
+local graph of symbols, field reads/writes, call edges and external boundaries:
+
+- **Field-level, not just call-level.** It follows getters/setters, constructors,
+  builders, streams, collections, bean copy, ORM mappings and RPC dispatches.
+- **Dynamic dispatch is part of the graph.** An interface call can be bridged into
+  every analysed implementation; the trace does not stop at the declaration.
+- **Evidence is attached to every edge.** Source file, line/column, resolution
+  strength, provenance and effect location are first-class output.
+- **Uncertainty is explicit.** External calls, missing classpath, ambiguous
+  overloads and condition-only consumption become named boundaries instead of
+  silent gaps.
+- **Local by default.** The index is a project-local SQLite database; no source
+  upload and no external service are required.
+
+The acceptance question is not "does it produce a graph?" but **"are the reported
+fields and paths actually supported by source?"**
+
+## Acceptance Criteria
+
+| ID | Criterion | Target | Result |
+|---|---|---|---|
+| CR-1 | Build and release artifacts reproduce | jar + SBOM + archive | PASS |
+| CR-2 | Index reliability on the full corpus | 100% READY | PASS (47/47) |
+| CR-3 | Trace reliability on the full corpus | 100% success | PASS (4,749/4,749) |
+| CR-4 | Strict edge precision vs source | >= 99.5% | PASS (99.63% first round, 100% final) |
+| CR-5 | Field target recall | >= 99% | PASS (99.88%) |
+| CR-6 | True false positives | 0 after fixes | PASS (2 found, root-caused and fixed) |
+| CR-7 | Quality regression | 0 | PASS (0 precision regression) |
+| CR-8 | Index cleanup safety | source untouched | PASS |
+| CR-9 | Performance bounds | no unbounded trace | PASS |
+| CR-10 | Boundary semantics | condition/external explicit | PASS |
+
+## Benchmark Results
+
+### 1. Field-lineage accuracy
+
+First full-source verification round:
+
+| Metric | Result |
+|---|---:|
+| Sampled method/target cases | 2,200 |
+| Strict edges checked against source | 7,837 |
+| Edge precision | **99.63%** |
+| Target recall (value reads) | **99.88%** |
+| Residuals | 28 |
+| — anchor/path precision (value flow valid) | 26 |
+| — true false positives | 2 (0.03%) |
+
+The two true false positives were the same root cause: a `List<Element>` projected
+to `List<String>` by `map(getId)` still carried an element field path. The fix
+requires declared element types and container projection evidence; after the fix
+the path was removed and the sample re-verified.
+
+Second focused verification round after fixes:
+
+| Metric | Result |
+|---|---:|
+| Strict edges checked | 862 |
+| Hits | **862 (100%)** |
+| Quality changes | 0 |
+
+Final 47-project acceptance rescan:
+
+| Metric | Result |
+|---|---:|
+| Projects | 47 |
+| Method/target cases | 4,749 |
+| Strict edges checked | 7,623 |
+| Hits | **7,623 (100%)** |
+| Bad edges / false positives | **0** |
+| Trace failures | **0** |
+| Quality fallbacks | 0 precision regressions |
+
+### 2. Broader quality distribution
+
+A 45-library batch over 627,987 method/target combinations:
+
+| Quality state | Share |
+|---|---:|
+| OK | **88.14%** |
+| PARTIAL | 8.59% |
+| DEPENDENCY_ONLY (condition-only) | 2.15% |
+| UNKNOWN | 1.13% |
+
+A larger 18,070-Java-file corpus over 64,552 cases:
+
+| Metric | Result |
+|---|---:|
+| Trace success | **100%** |
+| Quality OK | 83.4% |
+| Completeness COMPLETE | 42.2% |
+| Completeness PARTIAL | 55.2% |
+| Completeness UNKNOWN | 2.6% |
+| Weak hops | 81,181 |
+
+`UNKNOWN` here means no field-value evidence could be produced, not "field does
+not exist"; most cases are external frameworks, dynamic boundaries or
+condition-only use.
+
+### 2.5 Reindex acceptance
+
+Four previously unfinished or stale indexes were rebuilt from source and verified:
+
+| Target | Files | Value nodes | Data edges | State |
+|---|---:|---:|---:|---|
+| Large multi-module project A | 2,887 | 749,520 | 564,247 | READY / FRESH |
+| Mid-size project B | 2,316 | 320,825 | 241,400 | READY / FRESH |
+| Small project C | 82 | 2,162 | 866 | READY / FRESH |
+| Large project D | 6,276 | 1,139,427 | 868,341 | READY / FRESH |
+
+All four had WAL = 0 and `quick_check = ok`. A 40-edge source-anchor sample
+matched **40/40**, and the follow-up focused round matched **862/862**.
+
+### 3. Scale and performance
+
+| Change | Before | After |
+|---|---:|---:|
+| Redundant JOIN on a hot query | baseline | **3.3× faster** |
+| Repeated trace cache path | baseline | **5.7× faster** |
+| Pathological large call cone | unbounded / 600s CPU | **27s timeout** |
+| Boundary projection on a pathological case | 168s | **10s** |
+| 6,300-file index | previous limits | **~45.5 min**, 1.16M nodes / 890K edges |
+
+The final gate did not observe a trace that could not finish; all timeouts are
+explicit `TIME_LIMIT`/`DEPTH_LIMIT` boundaries with a reason code.
+
+### 4. Index lifecycle and data safety
+
+| Item | Result |
+|---|---:|
+| Stale/incomplete indexes removed | 54 |
+| Space reclaimed | **21.93 GiB** |
+| Source files deleted | **0** |
+| Half-built indexes detected | 2 |
+| Disk free after cleanup | 32 GiB → **63 GiB** |
+
+Only `.field-trace-graph/` index files (`trace.db`, `-wal`, `-shm`, lock files)
+were removed. Source, `classpath.txt`, release payloads and verification outputs
+were preserved.
+
+### 5. Fixes landed in the acceptance window
+
+The audit fixed 58 findings. Grouped by impact:
+
+| Group | Representative outcomes |
+|---|---|
+| Field-path resolution | nested object paths, lambda shadowing, stream element types, container element projection |
+| Call bridging | virtual/RPC implementations, builder chains, method references, iBatis/MyBatis SQL bridges |
+| Evidence precision | effect locations, constructor argument positions, multi-`return` anchors, element insertion anchors |
+| Boundary semantics | condition-only consumption, external/platform boundaries, ambiguous methods |
+| Performance | O(nodes × mutations) binder scans replaced by indexed lookup; deadline checks in storage scans |
+| Index lifecycle | batched publish, WAL bounds, failure state visibility, stale-index cleanup |
+
+## Charts
+
+```mermaid
+pie title 47-project final strict-edge check (7,623 edges)
+    "Matched" : 7623
+    "Bad / false positive" : 0
+```
+
+```mermaid
+pie title Broader corpus quality distribution (627,987 cases)
+    "OK" : 88.14
+    "PARTIAL" : 8.59
+    "DEPENDENCY_ONLY" : 2.15
+    "UNKNOWN" : 1.13
+```
+
+```mermaid
+xychart-beta
+    title "Acceptance metrics (%)"
+    x-axis ["Edge precision", "Target recall", "Trace success", "Index success"]
+    y-axis "Percent" 0 --> 100
+    bar [99.63, 99.88, 100, 100]
+```
+
+```mermaid
+flowchart LR
+    A["Index"] --> B["Call / field bridges"]
+    B --> C["Trace"]
+    C --> D["Source-anchored verification"]
+    D --> E["Quality + completeness"]
+    E --> F["Acceptance verdict"]
+```
+
+## Known Boundaries
+
+These are explicit limits, not hidden failures:
+
+- External method bodies and missing classpath remain `EXTERNAL_LIBRARY` /
+  `CLASSPATH_MISSING`; import a classpath or runtime evidence to continue.
+- Anonymous-class field identity and generated members may still stop at a
+  generated-code boundary.
+- Condition-only reads are `DEPENDENCY_ONLY`; they are intentionally excluded
+  from value-flow precision.
+- Ambiguous same-FQN methods across modules are reported with candidates; they
+  are not silently guessed.
+- Multi-return anchor precision and container scalar projection were found and
+  fixed in this window; they remain regression cases.
+
+## Verdict
+
+**PASS**, with the boundaries above documented as expected behavior.
+
+The strongest evidence is not the aggregate quality percentage; it is the
+source-anchored audit: **7,623 of 7,623 checked strict edges matched source, with
+0 bad edges, 0 trace failures and 0 precision regressions** in the final
+47-project rescan.

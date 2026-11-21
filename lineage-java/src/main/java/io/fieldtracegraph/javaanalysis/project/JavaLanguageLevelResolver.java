@@ -77,25 +77,83 @@ public final class JavaLanguageLevelResolver {
         try {
             Document document = SafeXmlReader.parse(pom);
             Map<String, String> properties = pomProperties(document);
-            String level = null;
-            for (String tag : new String[]{
-                    "release",
-                    "maven.compiler.release",
-                    "maven.compiler.target",
-                    "maven.compiler.source",
-                    "java.version",
-                    "target",
-                    "source"
-            }) {
-                level = resolvedText(firstText(document, tag), properties);
-                if (level != null) {
-                    break;
+            String level = compilerPluginLevel(document, properties);
+            if (level == null) {
+                for (String tag : new String[]{
+                        "maven.compiler.release",
+                        "maven.compiler.source",
+                        "java.version",
+                        "maven.compiler.target"
+                }) {
+                    level = resolvedText(firstText(document, tag), properties);
+                    if (level != null) {
+                        break;
+                    }
                 }
             }
             return level == null ? null : new LanguageLevelResolution(normalize(level), false, "pom");
         } catch (RuntimeException e) {
             return new LanguageLevelResolution(DEFAULT_LEVEL, true, "ASSUMED");
         }
+    }
+
+    // 作用：读取 maven-compiler-plugin 的显式配置；逻辑：优先 build/plugins，其次 pluginManagement，
+    // 按 release、source、target 顺序取第一个可解析值，与 Maven 的实际生效顺序一致。
+    private String compilerPluginLevel(Document document, Map<String, String> properties) {
+        for (String container : new String[]{"plugins", "pluginManagement"}) {
+            NodeList nodes = document.getElementsByTagName(container);
+            for (int i = 0; i < nodes.getLength(); i++) {
+                String level = compilerConfigurationLevel(nodes.item(i), properties);
+                if (level != null) {
+                    return level;
+                }
+            }
+        }
+        return null;
+    }
+
+    // 作用：在插件集合中定位编译插件配置；逻辑：逐个 plugin 比对 artifactId，命中后读取 configuration 子节点。
+    private String compilerConfigurationLevel(org.w3c.dom.Node container, Map<String, String> properties) {
+        NodeList plugins = container instanceof Element element
+                ? element.getElementsByTagName("plugin")
+                : container.getChildNodes();
+        for (int i = 0; i < plugins.getLength(); i++) {
+            if (!(plugins.item(i) instanceof Element plugin)) {
+                continue;
+            }
+            String artifactId = childText(plugin, "artifactId");
+            if (artifactId == null || !"maven-compiler-plugin".equals(artifactId.trim())) {
+                continue;
+            }
+            Element configuration = childElement(plugin, "configuration");
+            if (configuration == null) {
+                continue;
+            }
+            for (String tag : new String[]{"release", "source", "target"}) {
+                String level = resolvedText(childText(configuration, tag), properties);
+                if (level != null) {
+                    return level;
+                }
+            }
+        }
+        return null;
+    }
+
+    // 作用：读取直接子元素文本；逻辑：只匹配第一层同名子节点，避免命中嵌套的其它插件配置。
+    private String childText(Element parent, String tagName) {
+        Element child = childElement(parent, tagName);
+        return child == null ? null : child.getTextContent();
+    }
+
+    // 作用：读取直接子元素；逻辑：遍历一层子节点并按标签名匹配，未命中返回空。
+    private Element childElement(Element parent, String tagName) {
+        var children = parent.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            if (children.item(i) instanceof Element child && tagName.equals(child.getTagName())) {
+                return child;
+            }
+        }
+        return null;
     }
 
     // 作用：从 Gradle 构建脚本推断语言级别；逻辑：先匹配 options.release，再匹配 source/targetCompatibility。

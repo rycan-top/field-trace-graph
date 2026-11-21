@@ -100,7 +100,8 @@ public final class CallEdgeDao {
     public List<CallEdgeRecord> unresolvedCallEdgesForScopeIds(List<String> callerSymbolIds) {
         List<CallEdgeRecord> result = new ArrayList<>();
         for (PendingRefRecord ref : pendingRefsForScopeIds(callerSymbolIds)) {
-            if ("METHOD_REFERENCE".equals(ref.referenceKind())) {
+            if ("METHOD_REFERENCE".equals(ref.referenceKind())
+                    || "FIELD_ACCESSOR".equals(ref.referenceKind())) {
                 continue;
             }
             result.add(ref.toUnresolvedCallEdge(

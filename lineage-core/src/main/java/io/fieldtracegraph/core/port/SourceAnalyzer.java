@@ -26,4 +26,19 @@ public interface SourceAnalyzer {
     ) {
         return analyze(sourceFiles, projectRoot);
     }
+
+    /**
+     * Analyses sources under a hard deadline. Implementations that can check
+     * the deadline between files must override this; the default keeps older
+     * analyzers working but cannot interrupt a long-running run.
+     */
+    // 作用：带截止时间分析源码；逻辑：默认忽略预算，支持细粒度检查的实现负责覆盖。
+    default AnalysisResult analyze(
+            List<SourceFileRecord> sourceFiles,
+            Path projectRoot,
+            SourceScanOptions options,
+            long deadlineNanos
+    ) {
+        return analyze(sourceFiles, projectRoot, options);
+    }
 }

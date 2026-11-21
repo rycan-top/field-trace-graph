@@ -47,6 +47,31 @@ final class ExpressionFlowSources {
         return List.copyOf(result);
     }
 
+    /**
+     * Every field read that appears anywhere inside an expression.
+     *
+     * <p>Value flow deliberately stops at an opaque call and leaves the
+     * argument relationship to {@code ARGUMENT_TO} bridges. A control
+     * condition is different: the branch depends on every read nested in it,
+     * including reads passed as arguments to predicates such as
+     * {@code Enum.X.isEquals(a.getFoo())}. Without this walk those fields have
+     * no evidence at all and are reported as {@code UNKNOWN}.</p>
+     */
+    // 作用：收集表达式内全部字段读取；逻辑：遍历所有 getter 与下标访问并按值键去重。
+    static List<Source> collectReads(Expression expression, JavaValueFlowContext context) {
+        Set<String> keys = new LinkedHashSet<>();
+        List<Source> result = new ArrayList<>();
+        for (MethodCallExpr call : expression.findAll(MethodCallExpr.class)) {
+            if (context.isGetter(call)) {
+                add(context.key(call), "FIELD_READ", keys, result);
+            }
+        }
+        for (ArrayAccessExpr access : expression.findAll(ArrayAccessExpr.class)) {
+            add(context.key(access), "READS_ELEMENT", keys, result);
+        }
+        return List.copyOf(result);
+    }
+
     // 作用：递归解析来源；逻辑：按运算、三元、switch、下标、getter、容器读取、转换调用与普通调用分类处理。
     private static void collect(
             Expression expression,
@@ -83,7 +108,12 @@ final class ExpressionFlowSources {
             return;
         }
         if (value instanceof ArrayAccessExpr) {
-            add(context.key(value), "READS_ELEMENT", keys, result);
+            ArrayAccessExpr access = (ArrayAccessExpr) value;
+            add(context.key(access), "READS_ELEMENT", keys, result);
+            // The index is an address dependency of the element read: a field
+            // used only as the index (`rows[index.getSeq()]`) is still read by
+            // this statement and must not disappear from provenance.
+            collect(access.getIndex(), keys, result, context);
             return;
         }
         if (value instanceof MethodCallExpr call && context.isGetter(call)) {
@@ -93,22 +123,25 @@ final class ExpressionFlowSources {
         if (value instanceof MethodCallExpr call) {
             if (context.containerReadKey(call) != null) {
                 add(context.key(call), "READS_ELEMENT", keys, result);
+                // Map/collection lookups derive the element from their key
+                // expression as well. Without walking the arguments a field
+                // read only inside the key (map.get(bean.getAreaId())) has no
+                // evidence at all and is reported as UNKNOWN.
+                for (Expression argument : call.getArguments()) {
+                    collect(argument, keys, result, context);
+                }
                 return;
             }
             if (context.isStreamCall(call)) {
                 add(context.key(call), "ASSIGNED_FROM", keys, result);
                 return;
             }
-            String receiverField = NON_LINEAGE_CALL_FILTER.isValueTransform(call, context)
-                    ? receiverFieldRead(call, context)
-                    : null;
-            if (receiverField != null) {
-                // Conversion/normalization calls such as toString(), setScale()
-                // or trim() do not change which field the value came from.
-                add(receiverField, "FIELD_READ", keys, result);
-                return;
-            }
             if (NON_LINEAGE_CALL_FILTER.isValueTransform(call, context)) {
+                // Conversions keep the receiver's origin, and predicates such
+                // as equals/contains also derive their result from every
+                // argument. Collect both instead of returning after the
+                // receiver: `a.getCode().equals(b.getStatus())` must expose
+                // b.status, and `orElse(fallback)` must expose the fallback.
                 call.getScope().ifPresent(scope -> {
                     if (!(scope instanceof ThisExpr)
                             && !(scope instanceof NameExpr name && isLikelyTypeName(name.getNameAsString()))) {
@@ -202,36 +235,6 @@ final class ExpressionFlowSources {
             }
         }
         return List.copyOf(result);
-    }
-
-    /**
-     * Returns the deepest accessor field in a call receiver chain. For
-     * {@code order.getPrice().setScale(2).toString()} this returns
-     * {@code order.price}, so a converted scalar still keeps its field origin
-     * without treating every call argument as a direct value source.
-     */
-    // 作用：查找接收者链上的字段读取；逻辑：逐层剥离转换调用与字段访问，返回最深的 getter 或容器读取键。
-    private static String receiverFieldRead(MethodCallExpr call, JavaValueFlowContext context) {
-        Expression current = call.getScope().orElse(null);
-        while (current != null) {
-            if (current instanceof MethodCallExpr receiverCall) {
-                if (context.isGetter(receiverCall)) {
-                    return context.key(receiverCall);
-                }
-                if (context.containerReadKey(receiverCall) != null
-                        || context.isStreamCall(receiverCall)) {
-                    return context.key(receiverCall);
-                }
-                current = receiverCall.getScope().orElse(null);
-                continue;
-            }
-            if (current instanceof com.github.javaparser.ast.expr.FieldAccessExpr field) {
-                current = field.getScope();
-                continue;
-            }
-            return null;
-        }
-        return null;
     }
 
     // 作用：猜测是否为类型名；逻辑：首字母大写视为可能的静态类型限定。

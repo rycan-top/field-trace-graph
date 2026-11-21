@@ -34,7 +34,30 @@ final class CallArgumentBinder {
         Map<String, List<MethodSummaryRecord>> summariesByScope = new HashMap<>();
         Map<String, Map<String, ValueNodeRecord>> nodesByPathAndScope = new HashMap<>();
         Set<String> fieldWriteIds = new HashSet<>();
+        Set<String> producedValueIds = new HashSet<>();
+        /*
+         * effectLocation/callerEffectTarget used to stream the whole scope once
+         * per parameter mutation. On a repository-wide scope that is
+         * O(nodes x mutations) and both stalls and exhausts the heap, so build
+         * the three lookups they need in a single pass instead.
+         */
+        Set<String> argumentIds = new HashSet<>();
+        for (CallEdgeRecord call : graph.callEdges()) {
+            for (String argumentId : call.argumentValueIds()) {
+                if (argumentId != null) {
+                    argumentIds.add(argumentId);
+                }
+            }
+        }
+        Map<String, ValueNodeRecord> argumentNodesById = new HashMap<>();
+        Map<String, String> fileIdByScope = new HashMap<>();
+        Map<String, ValueNodeRecord> containerElementsByScopeAndValue = new HashMap<>();
+        Map<String, String> pathByFileId = new HashMap<>();
+        for (var entry : graph.sourceFiles().entrySet()) {
+            pathByFileId.put(entry.getKey(), entry.getValue().relativePath());
+        }
         for (var edge : graph.dataEdges()) {
+            producedValueIds.add(edge.dstValueId());
             if ("FIELD_WRITE".equals(edge.edgeType())
                     || "MUTATES_PARAMETER".equals(edge.edgeType())) {
                 fieldWriteIds.add(edge.dstValueId());
@@ -54,6 +77,16 @@ final class CallArgumentBinder {
                 nodesByPathAndScope
                         .computeIfAbsent(node.scopeSymbolId(), key -> new LinkedHashMap<>())
                         .putIfAbsent(basePath(node), node);
+            }
+            fileIdByScope.putIfAbsent(node.scopeSymbolId(), node.fileId());
+            if (argumentIds.contains(node.valueId())) {
+                argumentNodesById.put(node.valueId(), node);
+            }
+            if ("CONTAINER_ELEMENT".equals(node.valueKind())) {
+                containerElementsByScopeAndValue.putIfAbsent(
+                        scopeAndValue(node.scopeSymbolId(), node.canonicalValue()),
+                        node
+                );
             }
         }
         for (MethodSummaryRecord summary : graph.methodSummaries()) {
@@ -82,13 +115,16 @@ final class CallArgumentBinder {
             }
             List<ValueNodeRecord> params = paramsByScope.getOrDefault(call.calleeSymbolId(), List.of());
             bindPlainArguments(call, params, bridges);
-            bindReturns(call, returnsByScope, bridges);
+            bindReturns(call, returnsByScope, producedValueIds, bridges);
             Set<String> summaryTargets = bindParameterEffects(
                     graph,
                     call,
                     params,
                     effectiveMutations.getOrDefault(call.calleeSymbolId(), List.of()),
                     nodesByPathAndScope.getOrDefault(call.calleeSymbolId(), Map.of()),
+                    argumentNodesById,
+                    containerElementsByScopeAndValue,
+                    fileIdByScope,
                     bridges
             );
             bindReceiverFieldWrites(
@@ -97,6 +133,9 @@ final class CallArgumentBinder {
                     paramIndexByScope.getOrDefault(call.calleeSymbolId(), Map.of()),
                     fieldWritesByScope.getOrDefault(call.calleeSymbolId(), List.of()),
                     summaryTargets,
+                    argumentNodesById,
+                    containerElementsByScopeAndValue,
+                    pathByFileId,
                     bridges
             );
         }
@@ -186,7 +225,8 @@ final class CallArgumentBinder {
                             calleeMutation.lineStart(),
                             calleeMutation.columnStart(),
                             calleeMutation.lineEnd(),
-                            calleeMutation.columnEnd()
+                            calleeMutation.columnEnd(),
+                            calleeMutation.fileId()
                     );
                     mutations.putIfAbsent(effectiveMutationKey(forwarded), forwarded);
                 }
@@ -270,12 +310,26 @@ final class CallArgumentBinder {
     private void bindReturns(
             CallEdgeRecord call,
             Map<String, List<ValueNodeRecord>> returnsByScope,
+            Set<String> producedValueIds,
             List<Bridge> bridges
     ) {
         if (call.resultValueId() == null) {
             return;
         }
-        for (ValueNodeRecord returnNode : returnsByScope.getOrDefault(call.calleeSymbolId(), List.of())) {
+        List<ValueNodeRecord> returnNodes =
+                returnsByScope.getOrDefault(call.calleeSymbolId(), List.of());
+        /*
+         * Per-return nodes coexist with the aggregate RETURN node that is
+         * created for every callable. Once at least one return statement
+         * produced a value, the aggregate node is an empty placeholder and
+         * bridging it would add a source-less RETURN_FROM hop.
+         */
+        boolean hasProducedReturn = returnNodes.stream()
+                .anyMatch(node -> producedValueIds.contains(node.valueId()));
+        for (ValueNodeRecord returnNode : returnNodes) {
+            if (hasProducedReturn && !producedValueIds.contains(returnNode.valueId())) {
+                continue;
+            }
             bridges.add(new Bridge(returnNode.valueId(), call.resultValueId(), new Step(
                     new ValueRef(returnNode.valueId(), List.of()),
                     new ValueRef(call.resultValueId(), List.of()),
@@ -304,6 +358,9 @@ final class CallArgumentBinder {
             List<ValueNodeRecord> params,
             List<ParameterMutationRecord> parameterMutations,
             Map<String, ValueNodeRecord> nodesByPath,
+            Map<String, ValueNodeRecord> argumentNodesById,
+            Map<String, ValueNodeRecord> containerElementsByScopeAndValue,
+            Map<String, String> fileIdByScope,
             List<Bridge> bridges
     ) {
         Set<String> targets = new HashSet<>();
@@ -344,14 +401,22 @@ final class CallArgumentBinder {
                         + "\u0001" + mutationTarget.valueId();
                 targets.add(targetKey);
                 EffectTarget effectTarget = callerEffectTarget(
-                        graph, call, argumentNodeId, mutation.targetPath()
+                        call,
+                        argumentNodeId,
+                        mutation.targetPath(),
+                        argumentNodesById,
+                        containerElementsByScopeAndValue
                 );
+                if (effectTarget.nodeId() == null) {
+                    continue;
+                }
+                String effectLocation = effectLocation(
+                        graph, call.calleeSymbolId(), mutation, fileIdByScope);
                 bridges.add(new Bridge(mutationTarget.valueId(), effectTarget.nodeId(), new Step(
                         new ValueRef(mutationTarget.valueId(), sourceFields),
                         new ValueRef(effectTarget.nodeId(), effectTarget.fields()),
                         mutation.operation(),
-                        "callee parameter effect at "
-                                + effectLocation(graph, call.calleeSymbolId(), mutation),
+                        "callee parameter effect at " + effectLocation,
                         call.resolution(),
                         Ids.sha256(
                                 call.callSiteId(),
@@ -365,7 +430,7 @@ final class CallArgumentBinder {
                         call.columnStart(),
                         call.lineEnd(),
                         call.columnEnd(),
-                        effectLocation(graph, call.calleeSymbolId(), mutation),
+                        effectLocation,
                         false,
                         call.callSiteId(),
                         CallContextDirection.LEAVE,
@@ -383,30 +448,33 @@ final class CallArgumentBinder {
      */
     // 作用：确定调用方受影响的目标；逻辑：根据实参路径与变更字段计算接收者节点与字段。
     private EffectTarget callerEffectTarget(
-            LineageGraph graph,
             CallEdgeRecord call,
             String argumentNodeId,
-            String targetPath
+            String targetPath,
+            Map<String, ValueNodeRecord> argumentNodesById,
+            Map<String, ValueNodeRecord> containerElementsByScopeAndValue
     ) {
         String path = targetPath == null ? "" : targetPath;
         if (!path.startsWith("[*]")) {
             return new EffectTarget(argumentNodeId, callerFields(path));
         }
-        ValueNodeRecord argument = graph.valueNodes().stream()
-                .filter(node -> argumentNodeId.equals(node.valueId()))
-                .findFirst()
-                .orElse(null);
+        ValueNodeRecord argument = argumentNodesById.get(argumentNodeId);
         if (argument == null) {
-            return new EffectTarget(argumentNodeId, callerFields(path));
+            /*
+             * A callee element write (`list[*].field`) targets the element
+             * object, never the list itself. When the caller exposes no such
+             * element node (the list is only handed to the callee), projecting
+             * the path onto the List would invent `list.field`, which no
+             * source line supports. Drop the bridge instead.
+             */
+            return new EffectTarget(null, List.of());
         }
         String elementValue = argument.canonicalValue() + "[*]";
-        return graph.valueNodes().stream()
-                .filter(node -> call.callerSymbolId().equals(node.scopeSymbolId()))
-                .filter(node -> "CONTAINER_ELEMENT".equals(node.valueKind()))
-                .filter(node -> elementValue.equals(node.canonicalValue()))
-                .findFirst()
-                .map(node -> new EffectTarget(node.valueId(), callerFields(path.substring(3))))
-                .orElseGet(() -> new EffectTarget(argumentNodeId, callerFields(path)));
+        ValueNodeRecord element = containerElementsByScopeAndValue.get(
+                scopeAndValue(call.callerSymbolId(), elementValue));
+        return element == null
+                ? new EffectTarget(null, List.of())
+                : new EffectTarget(element.valueId(), callerFields(path.substring(3)));
     }
 
     // 作用：绑定接收者字段写入；逻辑：把被调方对 this 字段的写入映射回调用方对象。
@@ -416,16 +484,27 @@ final class CallArgumentBinder {
             Map<String, Integer> paramIndexByName,
             List<ValueNodeRecord> fieldWrites,
             Set<String> summaryTargets,
+            Map<String, ValueNodeRecord> argumentNodesById,
+            Map<String, ValueNodeRecord> containerElementsByScopeAndValue,
+            Map<String, String> pathByFileId,
             List<Bridge> bridges
     ) {
         for (ValueNodeRecord fieldWrite : fieldWrites) {
+            /*
+             * The bridge is anchored at the caller's call site, but the write
+             * itself happens in the callee. Record the callee line as the
+             * effect location so the evidence stays auditable against source.
+             */
+            String effectLocation = location(fieldWrite, pathByFileId);
             if ("this".equals(fieldWrite.rootName())) {
                 if (call.receiverValueId() != null) {
                     bridges.add(fieldWriteBridge(
                             call,
                             fieldWrite,
                             call.receiverValueId(),
+                            fieldWrite.accessPath() == null ? List.of() : fieldWrite.accessPath(),
                             "field",
+                            effectLocation,
                             null
                     ));
                 }
@@ -443,14 +522,69 @@ final class CallArgumentBinder {
                     argumentNodeId + "\u0001" + parameterIndex + "\u0001" + fieldWrite.valueId())) {
                 continue;
             }
+            /*
+             * `list[*].field` is written on the element, not on the List.
+             * Resolve the caller's element node before bridging; attaching the
+             * bare field name to the List would claim a field the container
+             * does not have.
+             */
+            String wildcardPath = wildcardRelativePath(
+                    fieldWrite, params.get(parameterIndex).canonicalValue());
+            if (wildcardPath != null) {
+                EffectTarget effectTarget = callerEffectTarget(
+                        call,
+                        argumentNodeId,
+                        wildcardPath,
+                        argumentNodesById,
+                        containerElementsByScopeAndValue
+                );
+                if (effectTarget.nodeId() == null) {
+                    continue;
+                }
+                bridges.add(fieldWriteBridge(
+                        call,
+                        fieldWrite,
+                        effectTarget.nodeId(),
+                        effectTarget.fields(),
+                        "arg" + parameterIndex,
+                        effectLocation,
+                        parameterIndex
+                ));
+                continue;
+            }
             bridges.add(fieldWriteBridge(
                     call,
                     fieldWrite,
                     argumentNodeId,
+                    fieldWrite.accessPath() == null ? List.of() : fieldWrite.accessPath(),
                     "arg" + parameterIndex,
+                    effectLocation,
                     parameterIndex
             ));
         }
+    }
+
+    // 作用：把元素字段写转换为形参相对路径；逻辑：仅处理 `param[*]...` 根，其余返回 null。
+    private String wildcardRelativePath(ValueNodeRecord fieldWrite, String parameterName) {
+        String root = fieldWrite.rootName();
+        if (root == null || parameterName == null || !root.startsWith(parameterName)) {
+            return null;
+        }
+        String relative = root.substring(parameterName.length());
+        if (!relative.startsWith("[*]")) {
+            return null;
+        }
+        StringBuilder path = new StringBuilder(relative);
+        for (String segment : fieldWrite.accessPath() == null ? List.<String>of() : fieldWrite.accessPath()) {
+            if (segment == null || segment.isBlank()) {
+                continue;
+            }
+            if (!segment.startsWith("[") && !segment.startsWith(".")) {
+                path.append('.');
+            }
+            path.append(segment);
+        }
+        return path.toString();
     }
 
     // 作用：查找实参对应的形参下标；逻辑：按节点标识或路径匹配参数列表。
@@ -481,10 +615,12 @@ final class CallArgumentBinder {
             CallEdgeRecord call,
             ValueNodeRecord fieldWrite,
             String targetNodeId,
+            List<String> targetFields,
             String evidenceSuffix,
+            String effectLocation,
             Integer argIndex
     ) {
-        List<String> fieldPath = fieldWrite.accessPath() == null ? List.of() : fieldWrite.accessPath();
+        List<String> fieldPath = targetFields;
         return new Bridge(fieldWrite.valueId(), targetNodeId, new Step(
                 new ValueRef(fieldWrite.valueId(), List.of()),
                 new ValueRef(targetNodeId, fieldPath),
@@ -497,7 +633,7 @@ final class CallArgumentBinder {
                 call.columnStart(),
                 call.lineEnd(),
                 call.columnEnd(),
-                "",
+                effectLocation,
                 false,
                 call.callSiteId(),
                 CallContextDirection.LEAVE,
@@ -509,16 +645,35 @@ final class CallArgumentBinder {
     private String effectLocation(
             LineageGraph graph,
             String scopeId,
-            ParameterMutationRecord mutation
+            ParameterMutationRecord mutation,
+            Map<String, String> fileIdByScope
     ) {
-        String fileId = graph.valueNodes().stream()
-                .filter(node -> scopeId.equals(node.scopeSymbolId()))
-                .map(ValueNodeRecord::fileId)
-                .findFirst()
-                .orElse(null);
+        /*
+         * A forwarded mutation keeps the deepest writer's line, so the scope
+         * that recorded it is the only correct file. Falling back to the
+         * immediate callee pointed effect= at an unrelated line (valve chains
+         * such as applyValve.invoke lost every setter anchor).
+         */
+        String fileId = mutation.fileId() != null && !mutation.fileId().isBlank()
+                ? mutation.fileId()
+                : fileIdByScope.get(scopeId);
         SourceFileRecord file = fileId == null ? null : graph.sourceFiles().get(fileId);
         String path = file == null ? String.valueOf(fileId) : file.relativePath();
         return path + ":" + mutation.lineStart() + ":" + mutation.columnStart();
+    }
+
+    // 作用：定位值节点的源码位置；逻辑：按文件标识取相对路径并拼接行列号。
+    private String location(ValueNodeRecord node, Map<String, String> pathByFileId) {
+        String path = pathByFileId.get(node.fileId());
+        if (path == null) {
+            return "";
+        }
+        return path + ":" + node.lineStart() + ":" + node.columnStart();
+    }
+
+    // 作用：拼接方法作用域与值文本的复合键；逻辑：用不可见分隔符避免与包名冲突。
+    private String scopeAndValue(String scopeId, String value) {
+        return scopeId + "\u0001" + value;
     }
 
     // 作用：把目标路径拆成调用方字段序列；逻辑：按点号切分并过滤空段。

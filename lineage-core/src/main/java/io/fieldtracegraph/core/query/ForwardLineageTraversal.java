@@ -39,9 +39,11 @@ public final class ForwardLineageTraversal {
                 return discovered;
             }
             state.visited.add(next);
-            if (frontier.visited.add(next)) {
+            if (frontier.offer(next)) {
                 frontier.depth.put(next, currentDepth + 1);
                 discovered.add(next);
+            } else if (frontier.capReason() != null) {
+                state.markTruncated(frontier.capReason());
             }
         }
         return discovered;

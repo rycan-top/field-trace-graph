@@ -77,6 +77,7 @@ public class ProjectIndexService {
             SourceScanOptions options
     ) {
         Path root = projectRootResolver.resolve(explicitProject);
+        options = ClasspathDiscovery.discover(root, options);
         Path lockPath = ProjectIndexPaths.toolDirectory(root).resolve("index.lock");
         try (ProjectWriteLock ignored = ProjectWriteLock.acquire(lockPath, lockTimeoutMillis)) {
             try (IndexRepository repository = repositoryFactory.create(ProjectIndexPaths.databasePath(root))) {
@@ -109,21 +110,30 @@ public class ProjectIndexService {
                 long deadline = System.nanoTime() + indexTimeoutMillis * 1_000_000L;
                 AnalysisResult analysis;
                 try {
-                    analysis = sourceAnalyzer.analyze(files, root, options);
+                    analysis = sourceAnalyzer.analyze(files, root, options, deadline);
                 } catch (RuntimeException e) {
+                    if (e.getMessage() != null && e.getMessage().startsWith("INDEX_TIMEOUT")) {
+                        repository.markFailedAttempt(
+                                attemptId, "INDEX_TIMEOUT", "Index exceeded the time budget");
+                        throw new IllegalStateException("INDEX_TIMEOUT");
+                    }
                     repository.markFailedAttempt(attemptId, "INDEX_ANALYSIS_FAILED", e.getMessage());
                     throw e;
                 }
-                if (System.nanoTime() > deadline) {
-                    repository.markFailedAttempt(attemptId, "INDEX_TIMEOUT", "Index exceeded the time budget");
-                    throw new IllegalStateException("INDEX_TIMEOUT");
-                }
+                /*
+                 * Do not discard a completed analysis because it finished
+                 * slightly past the budget. The deadline is enforced inside
+                 * the analyzer; once it returns, publishing is always the
+                 * better outcome than throwing away minutes of work.
+                 */
                 analysis = markGeneratedSources(analysis, files, root, options);
                 if (analysis.diagnostics().stream().anyMatch(Diagnostic::blocking)) {
                     Diagnostic first = analysis.diagnostics().stream().filter(Diagnostic::blocking).findFirst().orElseThrow();
                     repository.markFailedAttempt(attemptId, first.code(), first.message());
-                    throw new IllegalStateException("INDEX_ANALYSIS_FAILED: " + first.code());
+                    throw new IllegalStateException("INDEX_ANALYSIS_FAILED: " + first.code()
+                            + diagnosticsLocation(first) + first.message());
                 }
+                reportNonBlockingDiagnostics(analysis.diagnostics());
                 List<SourceFileRecord> currentFiles = sourceReader.capture(root, options);
                 sourceSnapshotVerifier.verify(files, currentFiles);
 
@@ -168,6 +178,29 @@ public class ProjectIndexService {
                 return repository.toStatusResult("FRESH");
             }
         }
+    }
+
+    // 作用：拼出诊断的位置前缀；逻辑：有相对路径时输出 path:line，缺失时返回分隔符，便于定位失败文件。
+    private String diagnosticsLocation(Diagnostic diagnostic) {
+        if (diagnostic.relativePath() == null || diagnostic.relativePath().isBlank()) {
+            return ": ";
+        }
+        String location = diagnostic.line() == null
+                ? diagnostic.relativePath()
+                : diagnostic.relativePath() + ":" + diagnostic.line();
+        return " at " + location + ": ";
+    }
+
+    // 作用：把非阻断诊断汇总输出到 stderr；逻辑：按 code 分组，输出数量与首个样例位置，
+    // 让语言级别上调、classpath 截断等降级信息不再被静默丢弃。
+    private void reportNonBlockingDiagnostics(List<Diagnostic> diagnostics) {
+        Map<String, List<Diagnostic>> grouped = diagnostics.stream()
+                .filter(diagnostic -> !diagnostic.blocking())
+                .collect(Collectors.groupingBy(Diagnostic::code, java.util.LinkedHashMap::new, Collectors.toList()));
+        grouped.forEach((code, items) -> {
+            Diagnostic first = items.get(0);
+            CliLog.warn(code + " x" + items.size() + diagnosticsLocation(first) + first.message());
+        });
     }
 
     // 作用：汇总当前文件哈希；逻辑：把源文件列表转换为路径到内容哈希的映射。

@@ -270,7 +270,8 @@ public final class MethodSummaryExtractor {
                     write.lineStart(),
                     write.columnStart(),
                     write.lineEnd(),
-                    write.columnEnd()
+                    write.columnEnd(),
+                    source.fileId()
             );
             mutations.putIfAbsent(mutationKey(mutation), mutation);
             if (operation.equals("WRITE_ELEMENT_FIELD")) {
@@ -315,7 +316,8 @@ public final class MethodSummaryExtractor {
                     call.getEnd().map(position -> position.line)
                             .orElse(call.getBegin().map(position -> position.line).orElse(1)),
                     call.getEnd().map(position -> position.column)
-                            .orElse(call.getBegin().map(position -> position.column).orElse(1))
+                            .orElse(call.getBegin().map(position -> position.column).orElse(1)),
+                    source.fileId()
             );
             mutations.putIfAbsent(mutationKey(mutation), mutation);
         }
@@ -443,12 +445,13 @@ public final class MethodSummaryExtractor {
                 .filter(candidate -> candidate.methodName().equals(scope.displayName()))
                 .findFirst();
         if (accessor.isPresent() && "WRITE".equals(accessor.get().kind())) {
+            String targetPath = accessorWritePath(type, accessor.get().fieldName());
             ValueNodeRecord target = nodeCatalog.ensure(
                     source, scope, nodes, accumulator,
-                    "this." + accessor.get().fieldName(), "FIELD", scope.callable()
+                    targetPath, "FIELD", scope.callable()
             );
-            grouped.putIfAbsent("this." + accessor.get().fieldName() + "\u0001",
-                    new FieldWriteAccumulator("this." + accessor.get().fieldName(),
+            grouped.putIfAbsent(targetPath + "\u0001",
+                    new FieldWriteAccumulator(targetPath,
                             target.valueId(), new ArrayList<>(), "", scope.callable()));
         }
         return grouped.values().stream()
@@ -457,6 +460,19 @@ public final class MethodSummaryExtractor {
                         .comparingInt(FieldWriteSummary::lineStart)
                         .thenComparing(FieldWriteSummary::target))
                 .toList();
+    }
+
+    // 作用：确定访问器写入的字段路径；逻辑：静态字段用类型名限定，实例字段用 this 限定，
+    // 与源码中 ClassName.field / this.field 的实际写法保持一致，避免生成孤立的幽灵节点。
+    private String accessorWritePath(TypeDeclaration<?> type, String fieldName) {
+        for (var field : type.getFields()) {
+            boolean declares = field.getVariables().stream()
+                    .anyMatch(variable -> variable.getNameAsString().equals(fieldName));
+            if (declares && field.isStatic()) {
+                return type.getNameAsString() + "." + fieldName;
+            }
+        }
+        return "this." + fieldName;
     }
 
     // 作用：累加单个字段写入；逻辑：确保目标节点存在，收集来源值并按路径与条件合并。

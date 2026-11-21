@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS pending_parse_invoke_ref (
     pending_id TEXT PRIMARY KEY,
     call_site_id TEXT NOT NULL,
     caller_symbol_id TEXT NOT NULL,
-    reference_kind TEXT NOT NULL CHECK (reference_kind IN ('METHOD', 'CONSTRUCTOR', 'METHOD_REFERENCE')),
+    reference_kind TEXT NOT NULL CHECK (reference_kind IN ('METHOD', 'CONSTRUCTOR', 'METHOD_REFERENCE', 'FIELD_ACCESSOR')),
     reference_name TEXT NOT NULL,
     reason TEXT NOT NULL,
     candidates_json TEXT NOT NULL,
@@ -233,6 +233,7 @@ CREATE INDEX IF NOT EXISTS idx_value_scope ON value_node(scope_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_value_kind ON value_node(scope_symbol_id, value_kind);
 CREATE INDEX IF NOT EXISTS idx_data_scope_dst ON value_data_edge(scope_symbol_id, dst_value_id);
 CREATE INDEX IF NOT EXISTS idx_data_scope_src ON value_data_edge(scope_symbol_id, src_value_id);
+CREATE INDEX IF NOT EXISTS idx_data_src_value ON value_data_edge(src_value_id);
 CREATE INDEX IF NOT EXISTS idx_data_logical_key ON value_data_edge(scope_symbol_id, src_value_id, dst_value_id, edge_type);
 CREATE INDEX IF NOT EXISTS idx_edge_evidence_logical ON edge_evidence(logical_edge_key);
 CREATE INDEX IF NOT EXISTS idx_edge_evidence_source ON edge_evidence(source_edge_id);

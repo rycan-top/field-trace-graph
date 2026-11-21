@@ -32,6 +32,8 @@ public final class JavaValueTypes {
             "LocalDateTime", "ZonedDateTime", "OffsetDateTime", "OffsetTime", "Duration",
             "Period", "Year", "YearMonth", "MonthDay", "ZoneId", "ZoneOffset",
             "UUID", "URI", "URL", "Path", "File", "Locale", "Pattern", "Matcher",
+            "Timestamp", "Time", "Throwable", "Exception", "RuntimeException",
+            "Error", "Class", "Charset", "Currency", "TimeZone", "ZoneRules",
             "Collection", "List", "Set", "Map", "Queue", "Deque", "Iterator", "Stream",
             "IntStream", "LongStream", "DoubleStream"
     );

@@ -11,6 +11,8 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 // 作用：校验并规范化 classpath 条目。
@@ -24,6 +26,8 @@ public final class ClasspathEntryValidator {
     private static final long MAX_ENTRY_BYTES = 256L * 1024 * 1024;
     private static final long MAX_DIRECTORY_BYTES = 1024L * 1024 * 1024;
     private static final int MAX_DIRECTORY_FILES = 50_000;
+    private static final int MAX_HASH_CACHE_ENTRIES = 4096;
+    private static final Map<String, String> HASH_CACHE = new ConcurrentHashMap<>();
 
     private final ClasspathManifestReader manifestReader = new ClasspathManifestReader();
 
@@ -107,14 +111,28 @@ public final class ClasspathEntryValidator {
 
     // 作用：计算文件 SHA-256；逻辑：分块读取文件并输出小写十六进制摘要。
     private String sha256(Path path) {
-        try (InputStream input = Files.newInputStream(path)) {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) >= 0) {
-                digest.update(buffer, 0, read);
+        try {
+            long size = Files.size(path);
+            long modified = Files.getLastModifiedTime(path).toMillis();
+            String key = path.toAbsolutePath().normalize() + "\u001f" + size + "\u001f" + modified;
+            String cached = HASH_CACHE.get(key);
+            if (cached != null) {
+                return cached;
             }
-            return HexFormat.of().formatHex(digest.digest());
+            String hash;
+            try (InputStream input = Files.newInputStream(path)) {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    digest.update(buffer, 0, read);
+                }
+                hash = HexFormat.of().formatHex(digest.digest());
+            }
+            if (HASH_CACHE.size() < MAX_HASH_CACHE_ENTRIES) {
+                HASH_CACHE.put(key, hash);
+            }
+            return hash;
         } catch (IOException | NoSuchAlgorithmException e) {
             throw new IllegalArgumentException("Unable to hash classpath entry: " + path, e);
         }

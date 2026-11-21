@@ -10,7 +10,10 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 // 作用：读写一条逻辑边的多份证据。
 // 使用场景：证据导入、聚合展示与质量统计。
@@ -77,39 +80,119 @@ public final class EdgeEvidenceDao {
         }
     }
 
-    // 作用：按作用域查询边证据；逻辑：连接数据边与源节点，按作用域或节点作用域过滤并排序。
+    // 作用：按作用域查询边证据；逻辑：分别按证据作用域与源节点作用域走索引查询后合并去重。
     public List<EdgeEvidence> forScopeIds(List<String> scopeIds) {
         if (scopeIds.isEmpty() || !tableAvailable()) {
             return List.of();
         }
         String placeholders = String.join(",", Collections.nCopies(scopeIds.size(), "?"));
-        String query = "SELECT " + COLUMNS
+        String direct = "SELECT " + COLUMNS
                 + " FROM edge_evidence ev"
-                + " LEFT JOIN value_data_edge de ON de.edge_id = ev.source_edge_id"
-                + " LEFT JOIN value_node sn ON sn.value_id = de.src_value_id"
-                + " WHERE ev.scope_symbol_id IN (" + placeholders + ")"
-                + " OR sn.scope_symbol_id IN (" + placeholders + ")"
-                + " ORDER BY ev.logical_edge_key, ev.evidence_id";
-        try (PreparedStatement statement = connection.prepareStatement(query)) {
+                + " WHERE ev.scope_symbol_id IN (" + placeholders + ")";
+        String bridged = "SELECT " + COLUMNS
+                + " FROM value_node sn"
+                + " JOIN value_data_edge de ON de.src_value_id = sn.value_id"
+                + " JOIN edge_evidence ev ON ev.source_edge_id = de.edge_id"
+                + " WHERE sn.scope_symbol_id IN (" + placeholders + ")";
+        Map<String, EdgeEvidence> merged = new LinkedHashMap<>();
+        try {
+            collect(direct, scopeIds, merged, 0L);
+            collect(bridged, scopeIds, merged, 0L);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Unable to query edge evidence: " + e.getMessage(), e);
+        }
+        List<EdgeEvidence> result = new ArrayList<>(merged.values());
+        result.sort(Comparator.comparing(EdgeEvidence::logicalEdgeKey)
+                .thenComparing(EdgeEvidence::evidenceId));
+        return List.copyOf(result);
+    }
+
+    // 作用：执行单个证据查询并合并结果；逻辑：逐行检查预算，按 evidence_id 去重保留首行。
+    private void collect(
+            String query,
+            List<String> scopeIds,
+            Map<String, EdgeEvidence> merged,
+            long deadlineNanos
+    ) throws SQLException {
+        try (PreparedStatement scoped = connection.prepareStatement(query)) {
             for (int i = 0; i < scopeIds.size(); i++) {
-                statement.setString(i + 1, scopeIds.get(i));
+                scoped.setString(i + 1, scopeIds.get(i));
             }
-            for (int i = 0; i < scopeIds.size(); i++) {
-                statement.setString(scopeIds.size() + i + 1, scopeIds.get(i));
-            }
-            try (ResultSet resultSet = statement.executeQuery()) {
-                List<EdgeEvidence> result = new ArrayList<>();
+            try (ResultSet resultSet = scoped.executeQuery()) {
+                int seen = 0;
                 while (resultSet.next()) {
-                    result.add(GraphRowMapper.edgeEvidence(resultSet));
+                    /*
+                     * A single IN-list can scan a whole index segment. The
+                     * JDBC progress handler is not guaranteed to fire between
+                     * rows, so the row loop owns the hard deadline: a wide
+                     * evidence scan must abort inside the query budget.
+                     */
+                    if ((++seen & 0x3FF) == 0) {
+                        ensureBudget(deadlineNanos);
+                    }
+                    EdgeEvidence evidence = GraphRowMapper.edgeEvidence(resultSet);
+                    merged.putIfAbsent(evidence.evidenceId(), evidence);
                 }
-                return List.copyOf(result);
+            }
+        }
+    }
+
+    // 作用：按已加载边的证据/边 ID 取证据；逻辑：优先用 evidence_id 与 source_edge_id 分批查询，
+    // 避免按作用域全量加载大仓库证据导致堆溢出与长时间扫描。
+    public List<EdgeEvidence> forEdgeRefs(List<String> evidenceIds, List<String> sourceEdgeIds) {
+        return forEdgeRefs(evidenceIds, sourceEdgeIds, 0L);
+    }
+
+    // 作用：带预算地取证据；逻辑：每个分批查询前检查截止时间，超时就中止整个加载阶段。
+    public List<EdgeEvidence> forEdgeRefs(
+            List<String> evidenceIds,
+            List<String> sourceEdgeIds,
+            long deadlineNanos
+    ) {
+        if (!tableAvailable()) {
+            return List.of();
+        }
+        Map<String, EdgeEvidence> merged = new LinkedHashMap<>();
+        try {
+            for (List<String> chunk : chunks(evidenceIds)) {
+                ensureBudget(deadlineNanos);
+                String placeholders = String.join(",", Collections.nCopies(chunk.size(), "?"));
+                collect("SELECT " + COLUMNS + " FROM edge_evidence ev WHERE ev.evidence_id IN ("
+                        + placeholders + ")", chunk, merged, deadlineNanos);
+            }
+            for (List<String> chunk : chunks(sourceEdgeIds)) {
+                ensureBudget(deadlineNanos);
+                String placeholders = String.join(",", Collections.nCopies(chunk.size(), "?"));
+                collect("SELECT " + COLUMNS + " FROM edge_evidence ev WHERE ev.source_edge_id IN ("
+                        + placeholders + ")", chunk, merged, deadlineNanos);
             }
         } catch (SQLException e) {
-            throw new IllegalStateException(
-                    "Unable to query edge evidence: " + e.getMessage() + " SQL=" + query,
-                    e
-            );
+            throw new IllegalStateException("Unable to query edge evidence: " + e.getMessage(), e);
         }
+        List<EdgeEvidence> result = new ArrayList<>(merged.values());
+        result.sort(Comparator.comparing(EdgeEvidence::logicalEdgeKey)
+                .thenComparing(EdgeEvidence::evidenceId));
+        return List.copyOf(result);
+    }
+
+    // 作用：检查查询预算；逻辑：截止时间为 0 表示不限时，超时抛出可识别的中断异常。
+    private void ensureBudget(long deadlineNanos) {
+        if (deadlineNanos > 0 && System.nanoTime() > deadlineNanos) {
+            throw new IllegalStateException("query budget interrupted during evidence loading");
+        }
+    }
+
+    // 作用：切分 ID 批次；逻辑：去空去重后按固定大小分块，避免 SQLite 变量数量上限。
+    private List<List<String>> chunks(List<String> ids) {
+        List<String> distinct = ids.stream()
+                .filter(id -> id != null && !id.isBlank())
+                .distinct()
+                .toList();
+        List<List<String>> result = new ArrayList<>();
+        for (int start = 0; start < distinct.size(); start += 400) {
+            result.add(distinct.subList(start, Math.min(distinct.size(), start + 400)));
+        }
+        return result;
     }
 
     // 作用：判断逻辑边是否存在；逻辑：用分隔符拼接逻辑边键后与数据边表比对。

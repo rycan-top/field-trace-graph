@@ -1,13 +1,16 @@
 package io.fieldtracegraph.javaanalysis.extractor;
 
 import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.body.BodyDeclaration;
 import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
+import com.github.javaparser.ast.body.InitializerDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AssignExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.SwitchExpr;
 import com.github.javaparser.ast.expr.VariableDeclarationExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
@@ -62,9 +65,61 @@ public final class SequentialFlowExtractor {
         if (body == null) {
             return;
         }
-        Analysis analysis = new Analysis(source, scope, nodes, accumulator, context);
+        Analysis analysis = new Analysis(
+                source, scope, nodes, accumulator, context, scope.callable(), 0, true, true);
         analysis.analyzeStatements(body.getStatements(), new LinkedHashMap<>(), "", false);
         analysis.emitConditionUses();
+        int ordinal = analysis.statementOrdinal;
+        for (ObjectCreationExpr creation : scope.callable().findAll(ObjectCreationExpr.class)) {
+            if (creation.getAnonymousClassBody().isEmpty()) {
+                continue;
+            }
+            for (BodyDeclaration<?> member : creation.getAnonymousClassBody().orElseThrow()) {
+                if (member instanceof CallableDeclaration<?> anonymousCallable) {
+                    if (!CallableOwnership.belongsToCallableOrAnonymousBody(
+                            anonymousCallable, scope.callable())) {
+                        continue;
+                    }
+                    ordinal = analyzeAnonymousBody(
+                            source, scope, nodes, accumulator,
+                            context, anonymousCallable, ordinal
+                    );
+                } else if (member instanceof InitializerDeclaration initializer) {
+                    Analysis anonymousAnalysis = new Analysis(
+                            source, scope, nodes, accumulator, context,
+                            scope.callable(), ordinal, false, true
+                    );
+                    anonymousAnalysis.analyzeStatements(
+                            initializer.getBody().getStatements(), new LinkedHashMap<>(), "", false);
+                    ordinal = anonymousAnalysis.statementOrdinal;
+                }
+            }
+        }
+        analysis.statementOrdinal = ordinal;
+    }
+
+    // 作用：分析匿名类方法体；逻辑：复用外层符号与节点表，但以匿名方法作为语句归属，避免捕获写被丢弃。
+    private int analyzeAnonymousBody(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            CallableDeclaration<?> anonymousCallable,
+            int statementOrdinal
+    ) {
+        BlockStmt anonymousBody = bodyOf(anonymousCallable);
+        if (anonymousBody == null) {
+            return statementOrdinal;
+        }
+        Analysis anonymousAnalysis = new Analysis(
+                source, scope, nodes, accumulator,
+                context.withAnonymousParameters(anonymousCallable),
+                anonymousCallable, statementOrdinal, false, false
+        );
+        anonymousAnalysis.analyzeStatements(
+                anonymousBody.getStatements(), new LinkedHashMap<>(), "", false);
+        return anonymousAnalysis.statementOrdinal;
     }
 
     // 作用：取出可执行体的语句块；逻辑：方法取可选方法体，构造器取构造体，其他声明返回空。
@@ -97,6 +152,9 @@ public final class SequentialFlowExtractor {
         private final JavaAnalysisAccumulator accumulator;
         private final JavaValueFlowContext context;
         private final GuardConditionResolver guards;
+        private final CallableDeclaration<?> flowOwner;
+        private final boolean recordReturns;
+        private final boolean recordStreams;
         private final Map<String, Integer> occurrence = new LinkedHashMap<>();
         private int statementOrdinal;
 
@@ -106,14 +164,22 @@ public final class SequentialFlowExtractor {
                 CallableScope scope,
                 Map<String, ValueNodeRecord> nodes,
                 JavaAnalysisAccumulator accumulator,
-                JavaValueFlowContext context
+                JavaValueFlowContext context,
+                CallableDeclaration<?> flowOwner,
+                int statementOrdinal,
+                boolean recordReturns,
+                boolean recordStreams
         ) {
             this.source = source;
             this.scope = scope;
             this.nodes = nodes;
             this.accumulator = accumulator;
             this.context = context;
-            this.guards = new GuardConditionResolver(scope.callable(), context);
+            this.flowOwner = flowOwner;
+            this.recordReturns = recordReturns;
+            this.recordStreams = recordStreams;
+            this.statementOrdinal = statementOrdinal;
+            this.guards = new GuardConditionResolver(flowOwner, context);
         }
 
         // 作用：顺序分析一组语句；逻辑：复制输入状态，逐条分析并用上一条的输出作为下一条的输入。
@@ -166,7 +232,9 @@ public final class SequentialFlowExtractor {
                 return analyzeTry(tryStatement, input, pathCondition);
             }
             Map<String, String> state = new LinkedHashMap<>(input);
-            recordStreamDependencies(statement, state);
+            if (recordStreams) {
+                recordStreamDependencies(statement, state);
+            }
             recordStraightLineDefinitions(statement, state, pathCondition, controlled);
             if (statement instanceof ReturnStmt returnStatement) {
                 recordReturn(returnStatement, state, pathCondition, controlled);
@@ -180,7 +248,7 @@ public final class SequentialFlowExtractor {
                 Map<String, String> state
         ) {
             for (MethodCallExpr call : statement.findAll(MethodCallExpr.class)) {
-                if (!CallableOwnership.belongsToCallableOrAnonymousBody(call, scope.callable())
+                if (!CallableOwnership.belongsToCallableOrAnonymousBody(call, flowOwner)
                         || !context.isStreamCall(call)
                         || context.isIntermediateStreamCall(call)) {
                     continue;
@@ -443,17 +511,17 @@ public final class SequentialFlowExtractor {
                     && expressionStatement.getExpression() instanceof VariableDeclarationExpr declaration) {
                 declaration.getVariables().stream()
                         .filter(variable -> NodeFlowOwnership.belongsToOuterExecutable(
-                                variable, scope.callable()))
+                                variable, flowOwner))
                         .forEach(writes::add);
             }
             for (AssignExpr assignment : statement.findAll(AssignExpr.class)) {
-                if (NodeFlowOwnership.belongsToOuterExecutable(assignment, scope.callable())) {
+                if (NodeFlowOwnership.belongsToOuterExecutable(assignment, flowOwner)) {
                     writes.add(assignment);
                 }
             }
             for (MethodCallExpr call : statement.findAll(MethodCallExpr.class)) {
                 if (context.isSetter(call)
-                        && NodeFlowOwnership.belongsToOuterExecutable(call, scope.callable())) {
+                        && NodeFlowOwnership.belongsToOuterExecutable(call, flowOwner)) {
                     writes.add(call);
                 }
             }
@@ -475,13 +543,17 @@ public final class SequentialFlowExtractor {
                 String pathCondition,
                 boolean controlled
         ) {
-            if (statement.getExpression().isEmpty()
-                    || !NodeFlowOwnership.belongsToOuterExecutable(statement, scope.callable())) {
+            if (!recordReturns
+                    || statement.getExpression().isEmpty()
+                    || !NodeFlowOwnership.belongsToOuterExecutable(statement, flowOwner)) {
                 return;
             }
-            statementOrdinal = edgeEmitter.emit(source, scope, nodes, accumulator, context,
-                    statement.getExpression().orElseThrow(), "RETURN", false,
-                    statement, statementOrdinal, pathCondition);
+            ValueNodeRecord returnNode = edgeEmitter.ensureReturn(
+                    source, scope, nodes, accumulator, statement
+            );
+            statementOrdinal = edgeEmitter.emitToTarget(source, scope, nodes, accumulator, context,
+                    statement.getExpression().orElseThrow(), returnNode,
+                    statement, statementOrdinal, pathCondition, io.fieldtracegraph.core.model.Provenance.SOURCE);
             state.put("RETURN", "RETURN");
         }
 
@@ -533,36 +605,103 @@ public final class SequentialFlowExtractor {
 
         // 作用：补全所有控制条件的依赖；逻辑：遍历 if、循环及 switch 条件，逐个发射条件使用边。
         private void emitConditionUses() {
-            for (IfStmt statement : scope.callable().findAll(IfStmt.class)) {
-                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, scope.callable())) {
+            for (IfStmt statement : flowOwner.findAll(IfStmt.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
                     emitConditionUses(statement.getCondition(), statement);
                 }
             }
-            for (WhileStmt statement : scope.callable().findAll(WhileStmt.class)) {
-                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, scope.callable())) {
+            for (WhileStmt statement : flowOwner.findAll(WhileStmt.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
                     emitConditionUses(statement.getCondition(), statement);
                 }
             }
-            for (DoStmt statement : scope.callable().findAll(DoStmt.class)) {
-                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, scope.callable())) {
+            for (DoStmt statement : flowOwner.findAll(DoStmt.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
                     emitConditionUses(statement.getCondition(), statement);
                 }
             }
-            for (ForStmt statement : scope.callable().findAll(ForStmt.class)) {
-                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, scope.callable())) {
+            for (ForStmt statement : flowOwner.findAll(ForStmt.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
                     statement.getCompare().ifPresent(compare -> emitConditionUses(compare, statement));
                 }
             }
-            for (SwitchStmt statement : scope.callable().findAll(SwitchStmt.class)) {
-                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, scope.callable())) {
+            for (SwitchStmt statement : flowOwner.findAll(SwitchStmt.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
                     emitConditionUses(statement.getSelector(), statement);
                 }
             }
-            for (SwitchExpr statement : scope.callable().findAll(SwitchExpr.class)) {
-                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, scope.callable())) {
+            for (SwitchExpr statement : flowOwner.findAll(SwitchExpr.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
                     emitConditionUses(statement.getSelector(), statement);
                 }
             }
+            /*
+             * A ternary condition is a control dependency even though neither
+             * branch value derives from it. The expression collector already
+             * drops it from PHI inputs, so without this edge a field used only
+             * as {@code flag ? a : b} has no evidence at all and is reported as
+             * UNKNOWN. Skip ternaries nested inside an if/loop condition, which
+             * is already covered above.
+             */
+            for (com.github.javaparser.ast.expr.ConditionalExpr conditional
+                    : flowOwner.findAll(com.github.javaparser.ast.expr.ConditionalExpr.class)) {
+                if (!CallableOwnership.belongsToCallableOrAnonymousBody(conditional, flowOwner)
+                        || coveredByStatementCondition(conditional)) {
+                    continue;
+                }
+                emitConditionUses(conditional.getCondition(), conditional);
+            }
+            for (com.github.javaparser.ast.stmt.AssertStmt statement
+                    : flowOwner.findAll(com.github.javaparser.ast.stmt.AssertStmt.class)) {
+                if (CallableOwnership.belongsToCallableOrAnonymousBody(statement, flowOwner)) {
+                    emitConditionUses(statement.getCheck(), statement);
+                }
+            }
+        }
+
+        // 作用：判断三元是否已属于某个语句条件；逻辑：祖先中出现包含它的 if/循环/断言/switch 条件即为已覆盖。
+        private boolean coveredByStatementCondition(com.github.javaparser.ast.expr.ConditionalExpr conditional) {
+            for (Node ancestor = conditional.getParentNode().orElse(null);
+                 ancestor != null;
+                 ancestor = ancestor.getParentNode().orElse(null)) {
+                if (ancestor instanceof IfStmt statement
+                        && within(statement.getCondition(), conditional)) {
+                    return true;
+                }
+                if (ancestor instanceof WhileStmt statement
+                        && within(statement.getCondition(), conditional)) {
+                    return true;
+                }
+                if (ancestor instanceof DoStmt statement
+                        && within(statement.getCondition(), conditional)) {
+                    return true;
+                }
+                if (ancestor instanceof ForStmt statement
+                        && statement.getCompare().filter(compare -> within(compare, conditional)).isPresent()) {
+                    return true;
+                }
+                if (ancestor instanceof com.github.javaparser.ast.stmt.AssertStmt statement
+                        && within(statement.getCheck(), conditional)) {
+                    return true;
+                }
+                if (ancestor instanceof SwitchStmt statement
+                        && within(statement.getSelector(), conditional)) {
+                    return true;
+                }
+                if (ancestor instanceof SwitchExpr statement
+                        && within(statement.getSelector(), conditional)) {
+                    return true;
+                }
+                if (ancestor instanceof com.github.javaparser.ast.body.CallableDeclaration<?>) {
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        // 作用：判断节点是否位于指定祖先区域内；逻辑：祖先等于节点或确实是其祖先时成立。
+        private boolean within(Node ancestor, Node candidate) {
+            return ancestor == candidate || ancestor.isAncestorOf(candidate);
         }
 
         // 作用：发射单个条件的依赖边；逻辑：先确保条件节点存在，再把条件中引用的各来源连到条件节点。
@@ -571,14 +710,44 @@ public final class SequentialFlowExtractor {
             if (conditionKey.isBlank()) {
                 return;
             }
+            int line = anchor.getBegin().map(position -> position.line).orElse(1);
+            int column = anchor.getBegin().map(position -> position.column).orElse(1);
+            /*
+             * A getter used directly as a condition has the same semantic key
+             * as the field it reads (for example getIsGlobal() -> obj.global).
+             * Reusing that key as the condition node would suppress the only
+             * evidence edge as a self-loop, which also hides the field from
+             * downstream call-argument bridging. Keep a distinct logical
+             * condition node so the field -> condition dependency is explicit.
+             */
+            String conditionNodeKey = "branch:condition:" + conditionKey
+                    + "@" + line + ":" + column;
             ValueNodeRecord conditionNode = edgeEmitter.ensure(
-                    source, scope, nodes, accumulator, conditionKey, anchor
+                    source, scope, nodes, accumulator, conditionNodeKey, anchor
             );
+            java.util.Set<String> emitted = new java.util.HashSet<>();
             for (ExpressionFlowSources.Source operand : ExpressionFlowSources.collect(condition, context)) {
                 ValueNodeRecord origin = edgeEmitter.ensure(
                         source, scope, nodes, accumulator, operand.key(), condition
                 );
-                if (!origin.valueId().equals(conditionNode.valueId())) {
+                if (!origin.valueId().equals(conditionNode.valueId())
+                        && emitted.add(origin.valueId())) {
+                    edgeEmitter.addEdge(source, scope, accumulator, origin, conditionNode,
+                            "CONDITION_USES", "control condition", condition, statementOrdinal++);
+                }
+            }
+            /*
+             * Value flow stops at opaque calls, so a field read passed as an
+             * argument to a predicate (`Enum.X.isEquals(req.getType())`) would
+             * never reach the condition node. The branch does depend on it, so
+             * walk every read in the condition expression as well.
+             */
+            for (ExpressionFlowSources.Source read : ExpressionFlowSources.collectReads(condition, context)) {
+                ValueNodeRecord origin = edgeEmitter.ensure(
+                        source, scope, nodes, accumulator, read.key(), condition
+                );
+                if (!origin.valueId().equals(conditionNode.valueId())
+                        && emitted.add(origin.valueId())) {
                     edgeEmitter.addEdge(source, scope, accumulator, origin, conditionNode,
                             "CONDITION_USES", "control condition", condition, statementOrdinal++);
                 }

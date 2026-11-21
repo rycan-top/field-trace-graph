@@ -15,6 +15,7 @@ import io.fieldtracegraph.javaanalysis.flow.JavaValueFlowContext;
 import io.fieldtracegraph.javaanalysis.flow.NodeFlowOwnership;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,14 +30,22 @@ import java.util.Set;
  */
 public final class ContainerFactoryFlowExtractor {
     private static final Set<String> FACTORY_TYPES = Set.of(
-            "List", "Set", "Map", "ImmutableMap", "Collections", "Arrays"
+            "List", "Set", "Map", "ImmutableMap", "ImmutableList", "ImmutableSet",
+            "ImmutableSortedSet", "ImmutableSortedMap", "Collections", "Arrays",
+            "Lists", "Sets", "Maps", "Optional", "CompletableFuture"
     );
     private static final Set<String> FACTORY_METHODS = Set.of(
             "of", "asList", "singletonList", "singleton", "unmodifiableList",
-            "unmodifiableSet", "unmodifiableMap", "copyOf"
+            "unmodifiableSet", "unmodifiableMap", "copyOf", "ofNullable",
+            "newArrayList", "newLinkedList", "newHashSet", "newLinkedHashSet",
+            "newHashMap", "newLinkedHashMap", "newTreeMap", "newTreeSet",
+            "ofEntries", "singletonMap", "emptyList", "emptySet", "emptyMap",
+            "completedFuture"
     );
+    private static final Map<String, List<String>> TUPLE_SLOTS = tupleSlots();
 
     private final ValueEdgeEmitter edgeEmitter = new ValueEdgeEmitter();
+    private final ValueNodeCatalog nodeCatalog = new ValueNodeCatalog();
 
     // 作用：提取容器工厂流；逻辑：分别处理工厂调用、容器构造与容器赋值，生成元素与复制边。
     public void extract(
@@ -48,8 +57,17 @@ public final class ContainerFactoryFlowExtractor {
     ) {
         int ordinal = 0;
         for (MethodCallExpr call : scope.callable().findAll(MethodCallExpr.class)) {
-            if (!CallableOwnership.belongsToCallableOrAnonymousBody(call, scope.callable())
-                    || !isFactory(call)) {
+            if (!CallableOwnership.belongsToCallableOrAnonymousBody(call, scope.callable())) {
+                continue;
+            }
+            List<String> tupleSlots = tupleSlotsFor(call);
+            if (tupleSlots != null) {
+                ordinal = emitTupleFactory(
+                        source, scope, nodes, accumulator, context, call, tupleSlots, ordinal
+                );
+                continue;
+            }
+            if (!isFactory(call)) {
                 continue;
             }
             ordinal = emitFactoryCall(source, scope, nodes, accumulator, context, call, ordinal);
@@ -77,6 +95,109 @@ public final class ContainerFactoryFlowExtractor {
             ordinal = emitAssignmentCopy(source, scope, nodes, accumulator, context,
                     assignment.getValue(), context.key(assignment.getTarget()), assignment, ordinal);
         }
+    }
+
+    /**
+     * Tuple factories are value factories, not collections. Their components
+     * are named fields, so modelling each position as a field slot lets
+     * {@code Pair.of(a, b).getRight()}, {@code Triple.of(a, b, c).getMiddle()}
+     * and {@code Tuple2.of(a, b).getT2()} continue through the same field
+     * expansion used by JavaBean getters. Library-specific aliases are added
+     * for tuples that expose both {@code tN} and {@code _N} accessors.
+     */
+    // 作用：展开元组工厂；逻辑：把各位置参数写入结果字段槽，并补齐 tN/_N 别名。
+    private int emitTupleFactory(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            MethodCallExpr call,
+            List<String> slots,
+            int ordinal
+    ) {
+        String resultKey = context.key(call);
+        String displayRoot = context.display(call);
+        for (int index = 0; index < slots.size(); index++) {
+            Expression argument = call.getArgument(index);
+            String slot = slots.get(index);
+            String targetKey = resultKey + "." + slot;
+            ValueNodeRecord target = nodeCatalog.ensureField(
+                    source, scope, nodes, accumulator, targetKey, displayRoot,
+                    slot, "FIELD", call
+            );
+            for (ExpressionFlowSources.Source input : ExpressionFlowSources.collect(argument, context)) {
+                ValueNodeRecord origin = nodeCatalog.ensure(
+                        source, scope, nodes, accumulator, input.key(), null, argument
+                );
+                edgeEmitter.addEdge(
+                        source, scope, accumulator, origin, target,
+                        "FIELD_WRITE", "tuple " + slot, call, ordinal++,
+                        io.fieldtracegraph.core.model.Provenance.FRAMEWORK_ADAPTER
+                );
+            }
+            for (String alias : tupleAliases(slot)) {
+                ValueNodeRecord aliasNode = nodeCatalog.ensureField(
+                        source, scope, nodes, accumulator, resultKey + "." + alias,
+                        displayRoot, alias, "FIELD", call
+                );
+                edgeEmitter.addEdge(
+                        source, scope, accumulator, target, aliasNode,
+                        "ASSIGNED_FROM", "tuple alias " + alias, call, ordinal++,
+                        io.fieldtracegraph.core.model.Provenance.FRAMEWORK_ADAPTER
+                );
+            }
+        }
+        List<String> fieldNames = new ArrayList<>(slots);
+        for (String slot : slots) {
+            fieldNames.addAll(tupleAliases(slot));
+        }
+        return connectTupleAssignment(
+                source, scope, nodes, accumulator, context, call,
+                resultKey, displayRoot, fieldNames, ordinal
+        );
+    }
+
+    // 作用：把元组字段同步到局部变量或赋值目标；逻辑：识别直接初始化和赋值，并重复写入各字段。
+    private int connectTupleAssignment(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            MethodCallExpr call,
+            String resultKey,
+            String displayRoot,
+            List<String> fieldNames,
+            int ordinal
+    ) {
+        Node parent = call.getParentNode().orElse(null);
+        String targetKey = null;
+        if (parent instanceof VariableDeclarator variable) {
+            targetKey = context.applyAlias(variable.getNameAsString());
+        } else if (parent instanceof AssignExpr assignment) {
+            targetKey = context.key(assignment.getTarget());
+        }
+        if (targetKey == null || targetKey.isBlank() || targetKey.equals(resultKey)) {
+            return ordinal;
+        }
+        for (String slot : fieldNames) {
+            String sourceKey = resultKey + "." + slot;
+            String targetFieldKey = targetKey + "." + slot;
+            ValueNodeRecord origin = nodeCatalog.ensureField(
+                    source, scope, nodes, accumulator, sourceKey, displayRoot,
+                    slot, "FIELD", call
+            );
+            ValueNodeRecord target = nodeCatalog.ensure(
+                    source, scope, nodes, accumulator, targetFieldKey, "FIELD", call
+            );
+            edgeEmitter.addEdge(
+                    source, scope, accumulator, origin, target,
+                    "ASSIGNED_FROM", "tuple assignment", call, ordinal++,
+                    io.fieldtracegraph.core.model.Provenance.FRAMEWORK_ADAPTER
+            );
+        }
+        return ordinal;
     }
 
     // 作用：展开工厂调用；逻辑：建立结果到元素槽的流，并把各参数来源写入元素槽。
@@ -269,6 +390,94 @@ public final class ContainerFactoryFlowExtractor {
         String receiver = call.getScope().map(Object::toString).orElse("");
         int dot = receiver.lastIndexOf('.');
         return dot < 0 ? receiver : receiver.substring(dot + 1);
+    }
+
+    // 作用：解析元组工厂字段槽；逻辑：按 Pair/Triple、TupleN、JavaTuples 与 Map.entry 分类给出字段名。
+    private List<String> tupleSlotsFor(MethodCallExpr call) {
+        String method = call.getNameAsString();
+        String receiver = simpleReceiver(call);
+        int arity = call.getArguments().size();
+        if ("entry".equals(method) && "Map".equals(receiver) && arity == 2) {
+            return List.of("key", "value");
+        }
+        if (!Set.of("of", "with").contains(method)) {
+            return null;
+        }
+        if ("Tuple".equals(receiver) && "of".equals(method) && arity >= 2) {
+            return underscoreSlots(arity);
+        }
+        if ("Tuples".equals(receiver) && "of".equals(method) && arity >= 2) {
+            return tSlots(arity);
+        }
+        List<String> slots = TUPLE_SLOTS.get(receiver);
+        if (slots == null || slots.size() != arity) {
+            return null;
+        }
+        if ("with".equals(method) && ("Pair".equals(receiver) || "Triple".equals(receiver))) {
+            return valueSlots(arity);
+        }
+        return slots;
+    }
+
+    // 作用：生成元组字段别名；逻辑：tN 与 _N 两种常见访问器命名互相补齐。
+    private List<String> tupleAliases(String slot) {
+        if (slot.matches("t\\d+")) {
+            return List.of("_" + slot.substring(1));
+        }
+        if (slot.matches("_\\d+")) {
+            return List.of("t" + slot.substring(1));
+        }
+        return List.of();
+    }
+
+    // 作用：构造值位置槽；逻辑：从 value0 开始按参数个数生成。
+    private static List<String> valueSlots(int count) {
+        List<String> slots = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            slots.add("value" + index);
+        }
+        return List.copyOf(slots);
+    }
+
+    // 作用：构造 reactor 元组槽；逻辑：从 t1 开始按参数个数生成。
+    private static List<String> tSlots(int count) {
+        List<String> slots = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            slots.add("t" + (index + 1));
+        }
+        return List.copyOf(slots);
+    }
+
+    // 作用：构造 vavr 元组槽；逻辑：从 _1 开始按参数个数生成。
+    private static List<String> underscoreSlots(int count) {
+        List<String> slots = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            slots.add("_" + (index + 1));
+        }
+        return List.copyOf(slots);
+    }
+
+    // 作用：登记常见元组工厂字段槽；逻辑：按库的访问器命名建立类型到字段名列表的映射。
+    private static Map<String, List<String>> tupleSlots() {
+        Map<String, List<String>> slots = new LinkedHashMap<>();
+        slots.put("Pair", List.of("left", "right"));
+        slots.put("ImmutablePair", List.of("left", "right"));
+        slots.put("MutablePair", List.of("left", "right"));
+        slots.put("Triple", List.of("left", "middle", "right"));
+        slots.put("ImmutableTriple", List.of("left", "middle", "right"));
+        slots.put("MutableTriple", List.of("left", "middle", "right"));
+        slots.put("KeyValue", List.of("key", "value"));
+        slots.put("Quartet", valueSlots(4));
+        slots.put("Quintet", valueSlots(5));
+        slots.put("Sextet", valueSlots(6));
+        slots.put("Septet", valueSlots(7));
+        slots.put("Octet", valueSlots(8));
+        slots.put("Ennead", valueSlots(9));
+        slots.put("Decade", valueSlots(10));
+        for (int arity = 2; arity <= 8; arity++) {
+            slots.put("Tuple" + arity, tSlots(arity));
+        }
+        return Map.copyOf(slots);
     }
 
     // 作用：提取 Map 工厂的值参数；逻辑：按下标间隔取每对的第二个参数。

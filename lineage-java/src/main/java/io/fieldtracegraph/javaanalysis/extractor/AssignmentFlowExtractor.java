@@ -76,19 +76,18 @@ public final class AssignmentFlowExtractor {
                     || NodeFlowOwnership.belongsToOuterExecutable(returnStmt, scope.callable())) {
                 continue;
             }
-            returnStmt.getExpression().ifPresent(expression ->
-                    addEdges(
-                            source,
-                            scope,
-                            nodes,
-                            accumulator,
-                            context,
-                            expression,
-                            "RETURN",
-                            false,
-                            expression,
-                            statementOrdinal[0]++
-                    ));
+            returnStmt.getExpression().ifPresent(expression -> {
+                ValueNodeRecord returnNode = edgeEmitter.ensureReturn(
+                        source, scope, nodes, accumulator, returnStmt
+                );
+                edgeEmitter.emitToTarget(
+                        source, scope, nodes, accumulator, context,
+                        expression, returnNode, expression,
+                        statementOrdinal[0]++,
+                        null,
+                        io.fieldtracegraph.core.model.Provenance.SOURCE
+                );
+            });
         }
     }
 

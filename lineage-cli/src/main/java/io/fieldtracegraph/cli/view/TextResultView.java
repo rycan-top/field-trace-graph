@@ -8,6 +8,8 @@ import io.fieldtracegraph.core.model.IndexStatusResult;
 import io.fieldtracegraph.core.model.MethodsResult;
 import io.fieldtracegraph.core.model.SourceResult;
 import io.fieldtracegraph.core.model.TargetsResult;
+import io.fieldtracegraph.core.model.TraceEdge;
+import io.fieldtracegraph.core.model.TraceNode;
 import io.fieldtracegraph.core.model.TraceResult;
 import io.fieldtracegraph.core.query.TraceCompleteness;
 import io.fieldtracegraph.core.query.TraceQuality;
@@ -122,6 +124,41 @@ public class TextResultView {
         return builder.toString();
     }
 
+    /**
+     * Whole-object copies, container aggregates and callee-effect bridges are
+     * labelled with the value version they create, which is anchored at the
+     * receiving variable -- often a declaration far from the statement that
+     * moved the value. The edge knows that statement, so print it whenever it
+     * differs from the destination label: readers get an exact line for both
+     * the version and the operation that produced it.
+     */
+    // 作用：边的实际证据位置；逻辑：与目标节点行号不同时追加 at=文件:行。
+    private String evidenceAnchor(TraceEdge edge, TraceNode destination) {
+        StringBuilder anchor = new StringBuilder();
+        if (edge.sourceFile() != null
+                && !edge.sourceFile().isBlank()
+                && edge.lineStart() > 0
+                && (destination == null || destination.lineStart() != edge.lineStart())) {
+            anchor.append("\tat=").append(fileName(edge.sourceFile())).append(':').append(edge.lineStart());
+        }
+        /*
+         * Cross-method writes are anchored at the caller's call site, but the
+         * field is assigned inside the callee. Keeping the callee position on
+         * the edge lets an auditor jump straight to the assignment instead of
+         * trusting the bridge.
+         */
+        if (edge.effectLocation() != null && !edge.effectLocation().isBlank()) {
+            anchor.append("\teffect=").append(edge.effectLocation());
+        }
+        return anchor.toString();
+    }
+
+    // 作用：取文件短名；逻辑：截取最后一个路径分隔符之后的内容。
+    private String fileName(String path) {
+        int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        return slash < 0 ? path : path.substring(slash + 1);
+    }
+
     // 作用：格式化追踪结果；逻辑：依次输出索引、方法、节点、边、链、边界、叶子、证据与完整性。
     private String traceText(TraceResult result) {
         StringBuilder builder = new StringBuilder();
@@ -164,6 +201,10 @@ public class TextResultView {
         }
         Map<String, String> nodeLabels = nodeLabels(result);
         Map<String, String> shortLabels = shortLabels(result);
+        Map<String, TraceNode> nodesById = new HashMap<>();
+        for (TraceNode node : result.nodes()) {
+            nodesById.put(node.nodeId(), node);
+        }
         builder.append("Edges:").append('\n');
         for (var edge : result.edges()) {
             builder.append("  ").append(nodeLabel(nodeLabels, edge.srcId())).append(" -> ").append(nodeLabel(nodeLabels, edge.dstId()))
@@ -184,6 +225,7 @@ public class TextResultView {
             if (edge.argIndex() != null) {
                 builder.append("\targ=").append(edge.argIndex());
             }
+            builder.append(evidenceAnchor(edge, nodesById.get(edge.dstId())));
             builder.append('\n');
         }
         builder.append("Chains: ").append(result.chains().size()).append('\n');
@@ -282,7 +324,7 @@ public class TextResultView {
                     builder.append('\t').append(evidence.expression());
                 }
                 if (evidence.effectLocation() != null && !evidence.effectLocation().isBlank()) {
-                    builder.append(" [effect: ").append(evidence.effectLocation()).append(']');
+                    builder.append("\teffect=").append(evidence.effectLocation());
                 }
                 builder.append('\n');
             }

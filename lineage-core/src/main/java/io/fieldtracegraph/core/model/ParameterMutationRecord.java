@@ -16,6 +16,25 @@ public record ParameterMutationRecord(
         int lineStart,
         int columnStart,
         int lineEnd,
-        int columnEnd
+        int columnEnd,
+        /*
+         * File that owns the recorded line. Forwarded mutations keep the
+         * originating callee's position, so the immediate callee's file is
+         * wrong for effect= evidence. Null for pre-0.1.18 snapshots.
+         */
+        String fileId
 ) {
+    public ParameterMutationRecord(
+            int parameterIndex,
+            String parameterName,
+            String targetPath,
+            String operation,
+            int lineStart,
+            int columnStart,
+            int lineEnd,
+            int columnEnd
+    ) {
+        this(parameterIndex, parameterName, targetPath, operation,
+                lineStart, columnStart, lineEnd, columnEnd, null);
+    }
 }

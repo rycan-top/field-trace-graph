@@ -30,7 +30,7 @@ public record LineageRuntimeProperties(
                 200L * 1024 * 1024,
                 64,
                 0L,
-                300_000L,
+                1_800_000L,
                 0L,
                 100,
                 5_000,

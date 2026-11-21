@@ -21,6 +21,7 @@ import com.github.javaparser.ast.stmt.WhileStmt;
 import io.fieldtracegraph.javaanalysis.flow.JavaValueFlowContext;
 
 import java.util.Set;
+import java.util.List;
 import java.util.Locale;
 
 // 作用：过滤与字段血缘无关的调用。
@@ -32,16 +33,37 @@ import java.util.Locale;
  * field propagation evidence.
  */
 public final class NonLineageCallFilter {
-    private static final Set<String> IGNORED_METHODS = Set.of(
-            "debug",
-            "error",
-            "info",
-            "trace",
-            "warn",
-            "toJSONString"
+    private static final Set<String> LOG_METHODS = Set.of(
+            "trace", "debug", "info", "warn", "warning", "error", "fatal",
+            "log", "logp", "logrb", "severe", "fine", "finer", "finest",
+            "config", "throwing"
     );
-    private static final Set<String> LOG_METHOD_PREFIXES = Set.of(
-            "trace", "debug", "info", "warn", "error", "fatal"
+    private static final List<String> LOG_METHOD_FRAGMENTS = List.of(
+            "error", "warn", "info", "debug", "trace", "fatal"
+    );
+    private static final Set<String> LOGGER_SIMPLE_TYPES = Set.of(
+            "logger", "log", "extendedlogger", "locationawarelogger",
+            "category", "jdklogger"
+    );
+    private static final List<String> LOGGER_TYPE_MARKERS = List.of(
+            "org.slf4j",
+            "org.apache.log4j",
+            "org.apache.logging",
+            "org.apache.commons.logging",
+            "ch.qos.logback",
+            "java.util.logging",
+            "org.jboss.logging",
+            "io.vertx.core.logging",
+            "org.tinylog"
+    );
+    private static final Set<String> LOGGER_FACTORY_METHODS = Set.of(
+            "getlogger", "getlog"
+    );
+    private static final Set<String> GENERIC_LOGGER_NAMES = Set.of(
+            "log", "logger", "_log"
+    );
+    private static final Set<String> CONSOLE_METHODS = Set.of(
+            "print", "println", "printf", "format"
     );
 
     private static final Set<String> PURE_CONVERSIONS = Set.of(
@@ -59,7 +81,39 @@ public final class NonLineageCallFilter {
             "doubleValue",
             "floatValue",
             "booleanValue",
-            "stringValue"
+            "stringValue",
+            "parseLong",
+            "parseInt",
+            "parseDouble",
+            "parseFloat",
+            "parseBoolean",
+            "toLong",
+            "toInteger",
+            "toInt",
+            "toDouble",
+            "toFloat",
+            "requireNonNull",
+            "requireNonNullElse",
+            "requireNonNullElseGet",
+            "checkNotNull",
+            "defaultIfNull",
+            "defaultIfBlank",
+            "defaultIfEmpty",
+            "defaultString",
+            "firstNonNull",
+            "orElse",
+            "orElseGet",
+            "orElseThrow"
+    );
+    private static final Set<String> PURE_UTILITY_TYPES = Set.of(
+            "StringUtils", "CollectionUtils", "ObjectUtils", "NumberUtils",
+            "BooleanUtils", "ArrayUtils", "MapUtils", "Objects"
+    );
+    private static final Set<String> PURE_PREDICATES = Set.of(
+            "equals", "equalsIgnoreCase", "contains", "containsKey",
+            "containsValue", "startsWith", "endsWith", "matches", "test",
+            "isEmpty", "isNotEmpty", "isBlank", "isNotBlank", "hasText",
+            "compare", "compareTo", "contentEquals"
     );
 
     private static final Set<String> IGNORED_RECEIVERS = Set.of(
@@ -71,11 +125,13 @@ public final class NonLineageCallFilter {
             "telemetry",
             "tracer",
             "alarm",
+            "alert",
             "counter",
             "histogram",
             "meter",
             "log",
             "logUtil",
+            "LoggerUtil",
             "logger"
     );
     // 作用：识别 Micrometer、OpenTelemetry 等开源监控/追踪 API 的埋点动作；逻辑：方法名白名单，命中后再看接收者是否像监控组件。
@@ -92,13 +148,19 @@ public final class NonLineageCallFilter {
 
     // 作用：综合判断调用是否为血缘噪声；逻辑：排除诊断、日志、监控、纯转换与控制条件调用，但保留 JSON 序列化。
     public boolean shouldIgnore(MethodCallExpr call, JavaValueFlowContext context) {
-        if (isInDiagnosticContext(call)) {
+        if (isInDiagnosticContext(call, context)) {
             return true;
         }
         if ("toJSONString".equals(call.getNameAsString())) {
             return false;
         }
-        if (isLogCall(call)) {
+        if (isLogCall(call, context)) {
+            return true;
+        }
+        if (isLogHelperName(call.getNameAsString())) {
+            return true;
+        }
+        if (isConsoleCall(call)) {
             return true;
         }
         if (isTelemetryCall(call)) {
@@ -144,10 +206,16 @@ public final class NonLineageCallFilter {
 
     // 作用：判断调用是否位于诊断或日志调用内部；逻辑：向上遍历到方法边界，命中诊断类父调用即返回真。
     public boolean isInDiagnosticContext(MethodCallExpr call) {
+        return isInDiagnosticContext(call, null);
+    }
+
+    // 作用：判断调用是否位于诊断或日志调用内部；逻辑：带类型上下文向上遍历，命中诊断类父调用即返回真。
+    public boolean isInDiagnosticContext(MethodCallExpr call, JavaValueFlowContext context) {
         for (Node ancestor = call.getParentNode().orElse(null);
              ancestor != null;
              ancestor = ancestor.getParentNode().orElse(null)) {
-            if (ancestor instanceof MethodCallExpr parent && shouldIgnoreDiagnosticCall(parent)) {
+            if (ancestor instanceof MethodCallExpr parent
+                    && shouldIgnoreDiagnosticCall(parent, context)) {
                 return true;
             }
             if (ancestor instanceof com.github.javaparser.ast.body.CallableDeclaration<?>) {
@@ -158,11 +226,17 @@ public final class NonLineageCallFilter {
     }
 
     // 作用：判断父调用是否属于诊断输出；逻辑：匹配忽略方法名、日志/监控调用或忽略接收者。
-    private boolean shouldIgnoreDiagnosticCall(MethodCallExpr call) {
-        if (IGNORED_METHODS.contains(call.getNameAsString())) {
+    private boolean shouldIgnoreDiagnosticCall(
+            MethodCallExpr call,
+            JavaValueFlowContext context
+    ) {
+        if ("toJSONString".equals(call.getNameAsString())) {
             return true;
         }
-        if (isLogCall(call) || isTelemetryCall(call)) {
+        if (isLogCall(call, context) || isConsoleCall(call) || isTelemetryCall(call)) {
+            return true;
+        }
+        if (isLogHelperName(call.getNameAsString())) {
             return true;
         }
         return call.getScope()
@@ -195,6 +269,12 @@ public final class NonLineageCallFilter {
         if (isPureConversion(call)) {
             return true;
         }
+        if (isPureUtilityCall(call)) {
+            return true;
+        }
+        if (PURE_PREDICATES.contains(call.getNameAsString())) {
+            return true;
+        }
         if (call.getScope().isEmpty()) {
             return false;
         }
@@ -205,6 +285,18 @@ public final class NonLineageCallFilter {
             return call.getArguments().isEmpty();
         }
         return isKnownValueTypeReceiver(receiver, context);
+    }
+
+    // 作用：判断是否为纯工具类调用；逻辑：接收者是常见无副作用工具类型时，参数即结果来源。
+    private boolean isPureUtilityCall(MethodCallExpr call) {
+        String receiver = call.getScope()
+                .map(Object::toString)
+                .map(value -> {
+                    int dot = value.lastIndexOf('.');
+                    return dot < 0 ? value : value.substring(dot + 1);
+                })
+                .orElse("");
+        return PURE_UTILITY_TYPES.contains(receiver);
     }
 
     // 作用：判断接收者是否为已知值类型；逻辑：按上下文键、this 字段名与去空白文本依次查声明类型。
@@ -296,14 +388,55 @@ public final class NonLineageCallFilter {
     }
 
     // 作用：判断调用是否为日志输出；逻辑：方法名以日志级别开头，且接收者形态像日志器。
-    private boolean isLogCall(MethodCallExpr call) {
+    private boolean isLogCall(MethodCallExpr call, JavaValueFlowContext context) {
         String method = call.getNameAsString().toLowerCase(Locale.ROOT);
-        return LOG_METHOD_PREFIXES.stream().anyMatch(method::startsWith)
-                && looksLikeLogger(call);
+        return isLogMethod(method) && looksLikeLogger(call, context);
     }
 
-    // 作用：判断接收者是否像日志器；逻辑：检查声明类型的简单名与变量名是否以 log/logger 相关形式出现。
-    private boolean looksLikeLogger(MethodCallExpr call) {
+    // 作用：判断方法名是否表达日志动作；逻辑：标准级别名直接命中，兼容 functionError 这类包装方法。
+    private boolean isLogMethod(String method) {
+        return LOG_METHODS.contains(method)
+                || method.startsWith("log")
+                || LOG_METHOD_FRAGMENTS.stream().anyMatch(method::contains);
+    }
+
+    /**
+     * Custom log helpers such as {@code writeLogAndCheckJbean(...)} keep the
+     * logging verb in a camel-case word instead of the method prefix. Their
+     * arguments are log payloads, so serialized beans inside them must not be
+     * treated as business lineage.
+     */
+    // 作用：识别名称中包含独立 log 词的包装日志方法；逻辑：按驼峰分词后比较完整单词，避免误伤 catalog/login。
+    private boolean isLogHelperName(String method) {
+        int start = 0;
+        for (int i = 1; i <= method.length(); i++) {
+            boolean boundary = i == method.length()
+                    || (Character.isUpperCase(method.charAt(i))
+                        && !Character.isUpperCase(method.charAt(i - 1)))
+                    || !Character.isLetterOrDigit(method.charAt(i));
+            if (!boundary) {
+                continue;
+            }
+            String word = method.substring(start, i).toLowerCase(Locale.ROOT);
+            if ("log".equals(word) || "logs".equals(word) || "logger".equals(word)) {
+                return true;
+            }
+            while (i < method.length() && !Character.isLetterOrDigit(method.charAt(i))) {
+                i++;
+            }
+            start = i;
+        }
+        return false;
+    }
+
+    /**
+     * Logger detection is type/API based rather than tied to one company's
+     * wrapper classes. A receiver is a logger when its declared type is a
+     * known logging type or package, when it is produced by a logger factory,
+     * or when it is one of the conventional generic logger variables.
+     */
+    // 作用：判断接收者是否像日志器；逻辑：按 Logger 类型、Logger 工厂调用与通用变量名识别。
+    private boolean looksLikeLogger(MethodCallExpr call, JavaValueFlowContext context) {
         Expression receiver = call.getScope().orElse(null);
         if (receiver == null) {
             return false;
@@ -312,31 +445,120 @@ public final class NonLineageCallFilter {
         if (receiverText.isBlank()) {
             return false;
         }
-        String declaredType = declaredType(call, receiverText).toLowerCase(Locale.ROOT);
-        String simpleType = simpleType(declaredType).toLowerCase(Locale.ROOT);
-        if (simpleType.endsWith("logger") || simpleType.endsWith("log")) {
+        Expression value = unwrap(receiver);
+        if (value instanceof MethodCallExpr factory && isLoggerFactoryCall(factory)) {
+            return true;
+        }
+        String declaredType = declaredType(call, receiverText, context);
+        if (isLoggerType(declaredType)) {
             return true;
         }
         String simpleReceiver = simpleName(receiverText).toLowerCase(Locale.ROOT);
-        return simpleReceiver.startsWith("log")
-                || simpleReceiver.startsWith("logger")
-                || simpleReceiver.endsWith("log")
-                || simpleReceiver.endsWith("logger");
+        return looksLikeLoggerName(simpleReceiver);
+    }
+
+    // 作用：判断接收者名称是否表达日志器；逻辑：通用 log/logger 名、含 Logger 的包装类以及 LogUtil/Logging 后缀。
+    private boolean looksLikeLoggerName(String name) {
+        return GENERIC_LOGGER_NAMES.contains(name)
+                || name.contains("logger")
+                || name.endsWith("logutil")
+                || name.endsWith("loggerutil")
+                || name.endsWith("logging")
+                || isProjectLogTraceName(name);
+    }
+
+    /*
+     * In-house log facades are named after the trace channel rather than
+     * "Logger": RequestLogTrace.info(...) took a whole object graph as
+     * varargs and every argument then looked like a field consumer, which
+     * produced `call:size(0).msg` style edges. Matching the suffix keeps the
+     * rule narrow: generic business log facades deliberately stay in the graph.
+     */
+    // 作用：识别项目内日志门面命名；逻辑：按 LogTrace/TraceLog/LogHelper 后缀匹配。
+    private boolean isProjectLogTraceName(String name) {
+        return name.endsWith("logtrace")
+                || name.endsWith("tracelog")
+                || name.endsWith("loghelper");
+    }
+
+    // 作用：判断调用是否输出到控制台；逻辑：接收者为 System.out/System.err，方法名为 print 系列。
+    private boolean isConsoleCall(MethodCallExpr call) {
+        String receiver = call.getScope()
+                .map(Expression::toString)
+                .map(value -> value.replaceAll("\\s+", ""))
+                .orElse("");
+        return ("System.out".equals(receiver) || "System.err".equals(receiver))
+                && CONSOLE_METHODS.contains(call.getNameAsString());
+    }
+
+    // 作用：判断工厂调用是否返回日志器；逻辑：方法名为 getLogger/getLog，或接收者是 LoggerFactory/LogManager。
+    private boolean isLoggerFactoryCall(MethodCallExpr call) {
+        String method = call.getNameAsString().toLowerCase(Locale.ROOT);
+        if (LOGGER_FACTORY_METHODS.contains(method)) {
+            return true;
+        }
+        String receiver = call.getScope()
+                .map(Expression::toString)
+                .map(this::simpleName)
+                .map(value -> value.toLowerCase(Locale.ROOT))
+                .orElse("");
+        return receiver.endsWith("loggerfactory")
+                || receiver.endsWith("logfactory")
+                || receiver.endsWith("logmanager");
+    }
+
+    // 作用：判断声明类型是否为日志器；逻辑：简单类型命中 Logger/Log/Category，或全名包含常见日志框架包。
+    private boolean isLoggerType(String type) {
+        if (type == null || type.isBlank()) {
+            return false;
+        }
+        String simpleName = simpleType(type).toLowerCase(Locale.ROOT);
+        if (LOGGER_SIMPLE_TYPES.contains(simpleName)
+                || simpleName.contains("logger")
+                || simpleName.endsWith("logutil")
+                || simpleName.endsWith("logging")
+                || isProjectLogTraceName(simpleName)) {
+            return true;
+        }
+        String fullName = type.toLowerCase(Locale.ROOT);
+        return LOGGER_TYPE_MARKERS.stream().anyMatch(fullName::contains);
     }
 
     // 作用：查找接收者文本对应的声明类型；逻辑：依次检查方法参数、局部变量与所属类型字段，未命中返回空串。
-    private String declaredType(MethodCallExpr call, String receiver) {
+    private String declaredType(
+            MethodCallExpr call,
+            String receiver,
+            JavaValueFlowContext context
+    ) {
+        String normalized = receiver;
+        if (normalized.startsWith("this.")) {
+            normalized = normalized.substring("this.".length());
+        } else if (normalized.startsWith("super.")) {
+            normalized = normalized.substring("super.".length());
+        }
+        String simple = simpleName(normalized);
+        if (context != null) {
+            String type = context.declaredType(normalized);
+            if (type == null) {
+                type = context.declaredType(simple);
+            }
+            if (type != null) {
+                return type;
+            }
+        }
         CallableDeclaration<?> callable = call.findAncestor(CallableDeclaration.class).orElse(null);
         if (callable == null) {
             return "";
         }
         for (Parameter parameter : callable.getParameters()) {
-            if (parameter.getNameAsString().equals(receiver)) {
+            if (parameter.getNameAsString().equals(normalized)
+                    || parameter.getNameAsString().equals(simple)) {
                 return parameter.getType().asString();
             }
         }
         for (VariableDeclarator variable : callable.findAll(VariableDeclarator.class)) {
-            if (variable.getNameAsString().equals(receiver)) {
+            if (variable.getNameAsString().equals(normalized)
+                    || variable.getNameAsString().equals(simple)) {
                 return variable.getType().asString();
             }
         }
@@ -347,7 +569,8 @@ public final class NonLineageCallFilter {
         }
         for (FieldDeclaration field : type.getFields()) {
             for (VariableDeclarator variable : field.getVariables()) {
-                if (variable.getNameAsString().equals(receiver)) {
+                if (variable.getNameAsString().equals(normalized)
+                        || variable.getNameAsString().equals(simple)) {
                     return variable.getType().asString();
                 }
             }

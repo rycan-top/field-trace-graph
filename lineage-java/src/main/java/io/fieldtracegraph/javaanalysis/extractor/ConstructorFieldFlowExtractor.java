@@ -35,7 +35,7 @@ import java.util.ArrayList;
  * Projects positional constructor arguments onto the fields assigned by the
  * source constructor. This closes the gap between an object-level
  * {@code new Type(arg)} edge and a concrete field such as
- * {@code param.pin}. Only source-proven assignments are emitted; Lombok or
+ * {@code param.ownerId}. Only source-proven assignments are emitted; Lombok or
  * external generated constructors remain outside this extractor.
  */
 public final class ConstructorFieldFlowExtractor {

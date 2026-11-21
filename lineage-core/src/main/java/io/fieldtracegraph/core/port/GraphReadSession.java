@@ -21,6 +21,16 @@ import java.util.Set;
  * published generation for every call and must be closed after use.
  */
 public interface GraphReadSession extends AutoCloseable {
+    /**
+     * Bounds a single long-running storage operation. Wide call cones can make
+     * one value-node query run for minutes even though the traversal budget is
+     * checked between phases; implementations should abort inside the query
+     * once this deadline passes.
+     */
+    // 作用：设置本次查询的硬截止时间；逻辑：默认忽略，存储实现可据此中断长时间扫描。
+    default void setDeadlineNanos(long deadlineNanos) {
+    }
+
     // 作用：读取本次快照的索引代数；逻辑：返回打开会话时固定的 generation 编号。
     int generation();
 
@@ -56,6 +66,10 @@ public interface GraphReadSession extends AutoCloseable {
 
     // 作用：按作用域 ID 批量取边证据；逻辑：返回每条逻辑边对应的来源与解析级别。
     List<EdgeEvidence> edgeEvidenceForScopeIds(List<String> scopeIds);
+
+    // 作用：按已加载边的证据 ID 取证据；逻辑：只加载当前图真正引用的证据行，
+    // 避免大作用域全量加载造成内存与扫描时间失控。
+    List<EdgeEvidence> edgeEvidenceForEdgeRefs(List<String> evidenceIds, List<String> sourceEdgeIds);
 
     // 作用：按调用方批量取调用边；逻辑：返回调用方到被调方的方法调用关系。
     List<CallEdgeRecord> callEdgesForScopeIds(List<String> callerSymbolIds);

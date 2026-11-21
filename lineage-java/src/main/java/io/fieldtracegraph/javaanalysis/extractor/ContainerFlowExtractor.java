@@ -128,6 +128,34 @@ public final class ContainerFlowExtractor {
                 addEdge(source, scope, element, target, "WRITES_ELEMENT",
                         call, guards, context, accumulator, statementOrdinal++);
             }
+            String root = call.getScope()
+                    .map(CallableOwnership::rootName)
+                    .orElse(null);
+            if (root != null
+                    && context.isMapRoot(root)
+                    && "put".equals(call.getNameAsString())
+                    && arguments.size() == 2) {
+                // A map key is stored in the container just like the value.
+                // Without this edge a key read (map.put(bean.getId(), v))
+                // would look like a dead field read.
+                for (ExpressionFlowSources.Source input
+                        : ExpressionFlowSources.collect(arguments.get(0), context)) {
+                    if (input.key() == null || input.key().isBlank()) {
+                        continue;
+                    }
+                    ValueNodeRecord keyValue = nodeCatalog.ensure(
+                            source,
+                            scope,
+                            nodes,
+                            accumulator,
+                            input.key(),
+                            "EXPRESSION",
+                            arguments.get(0)
+                    );
+                    addEdge(source, scope, keyValue, target, "CONTAINER_FLOW",
+                            call, guards, context, accumulator, statementOrdinal++);
+                }
+            }
         }
     }
 

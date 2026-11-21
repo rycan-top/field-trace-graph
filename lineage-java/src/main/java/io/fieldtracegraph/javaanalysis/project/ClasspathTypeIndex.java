@@ -21,7 +21,12 @@ import java.util.stream.Stream;
  * whole indexing run.
  */
 public final class ClasspathTypeIndex {
-    private static final int MAX_CLASSES = 60_000;
+    /**
+     * A large multi-module repository can exceed 60k dependency classes; the
+     * previous limit truncated the tail of the classpath and turned provable
+     * receivers back into {@code RECEIVER_TYPE_UNKNOWN} weak hops.
+     */
+    private static final int MAX_CLASSES = 150_000;
     private static final Set<String> PLATFORM_PREFIXES = Set.of(
             "java.", "javax.", "jdk.", "sun.", "com.sun."
     );

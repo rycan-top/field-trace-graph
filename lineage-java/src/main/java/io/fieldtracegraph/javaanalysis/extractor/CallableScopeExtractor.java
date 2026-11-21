@@ -173,10 +173,17 @@ public final class CallableScopeExtractor {
                 .map(TypeDeclaration::getNameAsString)
                 .orElse("this")), variable.getNameAsString())
                 : new FieldAccessExpr(new ThisExpr(), variable.getNameAsString());
+        /*
+         * The synthesized receiver has no source range, and a node without a
+         * range falls back to line 1 -- which put every field-initializer write
+         * at the top of the file. Anchor the whole synthesized assignment on the
+         * declaring variable so the reported line is the initializer itself.
+         */
+        variable.getRange().ifPresent(target::setRange);
         AssignExpr assignment = new AssignExpr(target, initializer.clone(), AssignExpr.Operator.ASSIGN);
-        initializer.getRange().ifPresent(assignment::setRange);
+        variable.getRange().ifPresent(assignment::setRange);
         ExpressionStmt statement = new ExpressionStmt(assignment);
-        assignment.getRange().ifPresent(statement::setRange);
+        variable.getRange().ifPresent(statement::setRange);
         return statement;
     }
 

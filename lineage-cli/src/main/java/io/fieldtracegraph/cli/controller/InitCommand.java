@@ -34,7 +34,7 @@ public class InitCommand implements Runnable {
     @Option(names = "--lock-timeout", defaultValue = "30", description = "Seconds to wait for the project write lock")
     private long lockTimeoutSeconds;
 
-    @Option(names = "--index-timeout", defaultValue = "300", description = "Seconds allowed for the initial index")
+    @Option(names = "--index-timeout", defaultValue = "1800", description = "Seconds allowed for the initial index")
     private long indexTimeoutSeconds;
 
     @Option(names = "--language-level", description = "Override the analysed Java language level")

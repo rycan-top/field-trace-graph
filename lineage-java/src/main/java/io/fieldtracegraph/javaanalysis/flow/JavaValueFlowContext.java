@@ -22,12 +22,15 @@ import com.github.javaparser.ast.expr.TypeExpr;
 import com.github.javaparser.ast.stmt.ForEachStmt;
 import io.fieldtracegraph.core.support.Ids;
 import io.fieldtracegraph.javaanalysis.JavaExpressionIdentity;
+import io.fieldtracegraph.javaanalysis.project.ClassFileMetadata;
+import io.fieldtracegraph.javaanalysis.project.ClasspathTypeIndex;
 import io.fieldtracegraph.javaanalysis.resolution.AccessorFieldIdentity;
 import io.fieldtracegraph.javaanalysis.resolution.JavaTypeNameResolver;
 import io.fieldtracegraph.javaanalysis.resolution.JavaValueTypes;
 import io.fieldtracegraph.javaanalysis.resolution.SourceTypeCatalog;
 import io.fieldtracegraph.javaanalysis.resolution.TypeArgumentResolver;
 
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -79,26 +82,71 @@ public final class JavaValueFlowContext {
             "findAny", "reduce", "min", "max", "sum", "count", "average", "summaryStatistics",
             "anyMatch", "allMatch", "noneMatch", "iterator", "spliterator", "close"
     );
+    /**
+     * Collector factories receive the stream element, not their own receiver.
+     * {@code collect(Collectors.groupingBy(k -> k.getChannelId()))} has
+     * {@code Collectors} as the receiver, so the lambda parameter type has to
+     * come from the enclosing stream chain.
+     */
+    private static final Set<String> COLLECTOR_FACTORY_METHODS = Set.of(
+            "groupingBy", "groupingByConcurrent", "partitioningBy", "toMap", "toConcurrentMap",
+            "mapping", "flatMapping", "filtering", "reducing", "collectingAndThen",
+            "teeing", "minBy", "maxBy", "averagingInt", "averagingLong", "averagingDouble",
+            "summingInt", "summingLong", "summingDouble", "summarizingInt",
+            "summarizingLong", "summarizingDouble", "toUnmodifiableList",
+            "toUnmodifiableSet", "toUnmodifiableMap"
+    );
 
     private final CallableDeclaration<?> callable;
     private final Map<String, String> elementAliases;
+    /**
+     * Lambda parameters are scoped to their own lambda. Two lambdas in one
+     * method may both name their parameter {@code k} with different element
+     * types; a single name-keyed map silently merged them.
+     */
+    private final Map<String, Map<String, String>> lambdaAliases;
+    private final Map<String, Map<String, String>> lambdaTypes;
+    /**
+     * Locals declared inside a lambda are scoped like its parameters. Two
+     * sibling lambdas may both declare {@code item}; the flat table kept only
+     * the last one and mis-typed the other.
+     */
+    private final Map<String, Map<String, String>> lambdaLocalTypes;
     private final Map<String, String> variableTypes;
     private final SourceTypeCatalog typeCatalog;
+    private final ClasspathTypeIndex classpathTypes;
     private final String declaringTypeQname;
 
     // 作用：创建值流上下文；逻辑：保存可调用体、元素别名、变量类型与声明类型等只读事实。
     private JavaValueFlowContext(
             CallableDeclaration<?> callable,
             Map<String, String> elementAliases,
+            Map<String, Map<String, String>> lambdaAliases,
+            Map<String, Map<String, String>> lambdaTypes,
+            Map<String, Map<String, String>> lambdaLocalTypes,
             Map<String, String> variableTypes,
             SourceTypeCatalog typeCatalog,
+            ClasspathTypeIndex classpathTypes,
             String declaringTypeQname
     ) {
         this.callable = callable;
         this.elementAliases = Map.copyOf(elementAliases);
+        this.lambdaAliases = copyScoped(lambdaAliases);
+        this.lambdaTypes = copyScoped(lambdaTypes);
+        this.lambdaLocalTypes = copyScoped(lambdaLocalTypes);
         this.variableTypes = Map.copyOf(variableTypes);
         this.typeCatalog = typeCatalog;
+        this.classpathTypes = classpathTypes;
         this.declaringTypeQname = declaringTypeQname;
+    }
+
+    // 作用：复制 lambda 作用域表；逻辑：逐层复制为不可变映射，避免调用方后续修改。
+    private static Map<String, Map<String, String>> copyScoped(
+            Map<String, Map<String, String>> scoped
+    ) {
+        Map<String, Map<String, String>> copy = new LinkedHashMap<>();
+        scoped.forEach((key, value) -> copy.put(key, Map.copyOf(value)));
+        return Map.copyOf(copy);
     }
 
     // 作用：由可调用体构建上下文；逻辑：自动取所在类型后委托完整构建入口。
@@ -126,6 +174,22 @@ public final class JavaValueFlowContext {
             TypeDeclaration<?> declaringType,
             SourceTypeCatalog typeCatalog
     ) {
+        return from(callable, declaringType, typeCatalog, null);
+    }
+
+    /**
+     * Classpath metadata makes external accessors provable. Without it a
+     * getter such as {@code headerElement.getName()} can only be inferred from
+     * the method name; with it the receiver type and the accessor method are
+     * checked in the dependency jar.
+     */
+    // 作用：构建完整上下文；逻辑：在源码类型目录之外补充 classpath 元数据，用于证明外部访问器。
+    public static JavaValueFlowContext from(
+            CallableDeclaration<?> callable,
+            TypeDeclaration<?> declaringType,
+            SourceTypeCatalog typeCatalog,
+            ClasspathTypeIndex classpathTypes
+    ) {
         Map<String, String> types = new LinkedHashMap<>();
         for (Parameter parameter : callable.getParameters()) {
             types.put(parameter.getNameAsString(), parameter.getType().asString());
@@ -145,41 +209,105 @@ public final class JavaValueFlowContext {
                             .ifPresent(qualifiedName -> types.put(qualifiedName + "." + name, type));
                 }
             }
+            /*
+             * Collaborators are often declared on a base class
+             * ({@code BaseDao.sqlMapClientTemplate}) or an abstract service.
+             * Without inherited entries the receiver type is unknown and every
+             * call site becomes a RECEIVER_TYPE_UNKNOWN weak hop.
+             */
+            if (typeCatalog != null) {
+                String qname = declaringType.getFullyQualifiedName()
+                        .orElse(declaringType.getNameAsString());
+                typeCatalog.fieldTypesInHierarchy(qname).forEach((name, type) -> {
+                    types.putIfAbsent(name, type);
+                    types.putIfAbsent("this." + name, type);
+                });
+            }
         }
 
         Map<String, String> aliases = new LinkedHashMap<>();
-        List<LambdaAliasCandidate> lambdaAliases = new java.util.ArrayList<>();
         for (ForEachStmt loop : callable.findAll(ForEachStmt.class)) {
             String path = collectionPath(loop.getIterable(), types, typeCatalog);
             if (path != null && !loop.getVariable().getVariables().isEmpty()) {
                 aliases.put(loop.getVariable().getVariables().get(0).getNameAsString(), path + "[*]");
             }
         }
-        for (MethodCallExpr call : callable.findAll(MethodCallExpr.class)) {
-            if (call.getScope().isEmpty()) {
+        Map<String, Map<String, String>> scopedAliases = new LinkedHashMap<>();
+        Map<String, Map<String, String>> scopedTypes = new LinkedHashMap<>();
+        Map<String, Integer> declaredNames = new LinkedHashMap<>();
+        for (LambdaExpr lambda : callable.findAll(LambdaExpr.class)) {
+            if (lambda.getParameters().isEmpty()) {
                 continue;
             }
-            String path = collectionPath(call.getScope().orElseThrow(), types, typeCatalog);
-            if (path == null || path.isBlank()) {
+            String containerPath = lambdaContainerPath(lambda, types, typeCatalog);
+            if (containerPath == null || containerPath.isBlank()) {
                 continue;
             }
-            for (Expression argument : call.getArguments()) {
-                if (argument instanceof LambdaExpr lambda
-                        && lambda.getParameters().size() == 1
-                        && !lambda.getParameter(0).getNameAsString().isBlank()) {
-                    recordLambdaParameterType(
-                            types, typeCatalog, lambda.getParameter(0), path);
-                    lambdaAliases.add(new LambdaAliasCandidate(
-                            path,
-                            lambda.getParameter(0).getNameAsString()
-                    ));
+            String declared = declaredTypeOfPath(containerPath, types, typeCatalog);
+            boolean map = isMapTypeName(declared);
+            TypeArgumentResolver arguments = declared == null
+                    ? null
+                    : new TypeArgumentResolver(typeCatalog);
+            Map<String, String> aliasesForLambda = new LinkedHashMap<>();
+            Map<String, String> typesForLambda = new LinkedHashMap<>();
+            List<Parameter> parameters = lambda.getParameters();
+            for (int index = 0; index < parameters.size(); index++) {
+                Parameter parameter = parameters.get(index);
+                String name = parameter.getNameAsString();
+                if (name.isBlank()) {
+                    continue;
+                }
+                declaredNames.merge(name, 1, Integer::sum);
+                String type = explicitParameterType(parameter);
+                if (type == null && arguments != null) {
+                    if (map && parameters.size() == 2) {
+                        type = index == 0
+                                ? arguments.mapKeyType(declared)
+                                : arguments.mapValueType(declared);
+                    } else {
+                        type = arguments.elementType(declared);
+                    }
+                }
+                if (type != null && !type.isBlank()) {
+                    typesForLambda.put(name, type);
+                }
+                /*
+                 * Only a single-parameter callback over a collection aliases
+                 * the parameter to the element. Map callbacks (key, value)
+                 * keep their own roots: the key is not the element and a
+                 * suffix such as {@code k.channelId} would be invented.
+                 */
+                if (parameters.size() == 1 && !map) {
+                    aliasesForLambda.put(name, containerPath + "[*]");
                 }
             }
+            scopedAliases.put(lambdaKey(lambda), aliasesForLambda);
+            scopedTypes.put(lambdaKey(lambda), typesForLambda);
         }
-        for (LambdaAliasCandidate candidate : lambdaAliases) {
-            if (isContainerPath(candidate.root(), types, typeCatalog)) {
-                aliases.putIfAbsent(candidate.parameter(), candidate.root() + "[*]");
+        /*
+         * Keep the flat view for callers that only have a name (call-site
+         * argument typing). Scoped lookups take precedence for expressions
+         * inside a lambda; the flat entry is a best-effort fallback.
+         */
+        scopedAliases.forEach((key, scoped) -> scoped.forEach((name, alias) -> {
+            if (declaredNames.getOrDefault(name, 0) == 1) {
+                aliases.putIfAbsent(name, alias);
             }
+        }));
+        scopedTypes.forEach((key, scoped) -> scoped.forEach((name, type) -> {
+            if (!types.containsKey(name)) {
+                types.put(name, type);
+            }
+        }));
+        Map<String, Map<String, String>> scopedLocals = new LinkedHashMap<>();
+        for (VariableDeclarator variable : callable.findAll(VariableDeclarator.class)) {
+            LambdaExpr lambda = variable.findAncestor(LambdaExpr.class).orElse(null);
+            if (lambda == null) {
+                continue;
+            }
+            scopedLocals
+                    .computeIfAbsent(lambdaKey(lambda), key -> new LinkedHashMap<>())
+                    .putIfAbsent(variable.getNameAsString(), variable.getType().asString());
         }
         String declaringTypeQname = declaringType == null
                 ? null
@@ -187,8 +315,37 @@ public final class JavaValueFlowContext {
         return new JavaValueFlowContext(
                 callable,
                 aliases,
+                scopedAliases,
+                scopedTypes,
+                scopedLocals,
                 types,
                 typeCatalog,
+                classpathTypes,
+                declaringTypeQname
+        );
+    }
+
+    /**
+     * Anonymous-class methods have no symbol of their own in the published
+     * graph; their nodes stay in the enclosing method. Their parameters are
+     * still real declarations, so a copy of the context with those types is
+     * required before the anonymous body can be flowed.
+     */
+    // 作用：派生匿名类方法上下文；逻辑：复制变量类型表并合入匿名方法的参数类型。
+    public JavaValueFlowContext withAnonymousParameters(CallableDeclaration<?> anonymousCallable) {
+        Map<String, String> types = new LinkedHashMap<>(variableTypes);
+        for (Parameter parameter : anonymousCallable.getParameters()) {
+            types.put(parameter.getNameAsString(), parameter.getType().asString());
+        }
+        return new JavaValueFlowContext(
+                callable,
+                elementAliases,
+                lambdaAliases,
+                lambdaTypes,
+                lambdaLocalTypes,
+                types,
+                typeCatalog,
+                classpathTypes,
                 declaringTypeQname
         );
     }
@@ -199,37 +356,90 @@ public final class JavaValueFlowContext {
      * u.getName())} leaves {@code u} as an unknown receiver and every call in
      * the lambda body becomes a boundary.
      */
-    // 作用：记录 lambda 参数类型；逻辑：显式类型直接采用，隐式类型按容器路径推导元素类型。
-    private static void recordLambdaParameterType(
-            Map<String, String> types,
-            SourceTypeCatalog typeCatalog,
-            Parameter parameter,
-            String containerPath
-    ) {
-        String name = parameter.getNameAsString();
-        if (types.containsKey(name)) {
-            return;
+    // 作用：读取显式参数类型；逻辑：未知或 var 类型返回 null，交由容器推导。
+    private static String explicitParameterType(Parameter parameter) {
+        if (parameter.getType().isUnknownType() || parameter.getType().isVarType()) {
+            return null;
         }
-        if (!parameter.getType().isUnknownType() && !parameter.getType().isVarType()) {
-            types.put(name, parameter.getType().asString());
-            return;
-        }
-        String elementType = elementTypeOfPath(containerPath, types, typeCatalog);
-        if (elementType != null && !elementType.isBlank()) {
-            types.put(name, elementType);
-        }
+        return parameter.getType().asString();
     }
 
-    // 作用：推导路径的元素类型；逻辑：先解析路径声明类型，再取泛型元素类型。
-    private static String elementTypeOfPath(
-            String path,
+    /**
+     * Stable identity of one lambda inside the callable. Lambda parameters are
+     * scoped to it, so two {@code k} parameters keep independent types and
+     * aliases.
+     */
+    // 作用：生成 lambda 作用域键；逻辑：用起始行列保证同一方法内唯一且可复现。
+    public static String lambdaKey(LambdaExpr lambda) {
+        int line = lambda.getBegin().map(position -> position.line).orElse(1);
+        int column = lambda.getBegin().map(position -> position.column).orElse(1);
+        return "lambda@" + line + ":" + column;
+    }
+
+    // 作用：生成 lambda 参数节点键；逻辑：作用域键加参数名，避免同名参数共用节点。
+    public String lambdaParameterKey(LambdaExpr lambda, int index) {
+        return lambdaKey(lambda) + ":" + lambda.getParameter(index).getNameAsString();
+    }
+
+    /**
+     * Container whose elements feed this lambda. A direct callback
+     * ({@code list.forEach(x -> ...)}) uses the receiver. A collector factory
+     * ({@code collect(Collectors.groupingBy(k -> ...))}) uses the element of
+     * the enclosing stream chain, because its receiver is {@code Collectors}.
+     */
+    // 作用：解析 lambda 参数来源容器；逻辑：优先接收者容器，收集器工厂回退到外层流链元素。
+    public String lambdaElementPath(LambdaExpr lambda) {
+        return lambdaContainerPath(lambda, variableTypes, typeCatalog);
+    }
+
+    // 作用：静态解析 lambda 来源容器；逻辑：直接接收者优先，收集器工厂沿外层流调用回溯。
+    private static String lambdaContainerPath(
+            LambdaExpr lambda,
             Map<String, String> types,
             SourceTypeCatalog typeCatalog
     ) {
-        String declared = declaredTypeOfPath(path, types, typeCatalog);
-        return declared == null
-                ? null
-                : new TypeArgumentResolver(typeCatalog).elementType(declared);
+        MethodCallExpr owner = ownerCall(lambda);
+        if (owner == null) {
+            return null;
+        }
+        String direct = owner.getScope()
+                .map(scope -> collectionPath(scope, types, typeCatalog))
+                .orElse(null);
+        if (direct != null && isContainerPath(direct, types, typeCatalog)) {
+            return direct;
+        }
+        if (!COLLECTOR_FACTORY_METHODS.contains(owner.getNameAsString())) {
+            return null;
+        }
+        MethodCallExpr streamCall = enclosingStreamCall(owner);
+        if (streamCall == null || streamCall.getScope().isEmpty()) {
+            return null;
+        }
+        String source = collectionPath(streamCall.getScope().orElseThrow(), types, typeCatalog);
+        return source != null && isContainerPath(source, types, typeCatalog) ? source : null;
+    }
+
+    // 作用：定位 lambda 所属调用；逻辑：仅当 lambda 直接作为实参时返回该调用。
+    private static MethodCallExpr ownerCall(LambdaExpr lambda) {
+        return lambda.getParentNode()
+                .filter(parent -> parent instanceof MethodCallExpr call
+                        && call.getArguments().contains(lambda))
+                .map(parent -> (MethodCallExpr) parent)
+                .orElse(null);
+    }
+
+    // 作用：查找外层流调用；逻辑：沿父链找到第一个带接收者的流阶段调用。
+    private static MethodCallExpr enclosingStreamCall(MethodCallExpr call) {
+        com.github.javaparser.ast.Node current = call.getParentNode().orElse(null);
+        while (current != null) {
+            if (current instanceof MethodCallExpr candidate
+                    && STREAM_STAGES.contains(candidate.getNameAsString())
+                    && candidate.getScope().isPresent()) {
+                return candidate;
+            }
+            current = current.getParentNode().orElse(null);
+        }
+        return null;
     }
 
     // 作用：解析路径的声明类型；逻辑：直接查表，否则按成员递归解析并处理 values、keySet、entrySet 与字段类型。
@@ -462,7 +672,36 @@ public final class JavaValueFlowContext {
             // the name-only getter rule for calls such as service.getTime().
             return applyAlias(JavaExpressionIdentity.callKey(call));
         }
+        if (value instanceof NameExpr name) {
+            return aliasFor(name);
+        }
         return applyAlias(JavaExpressionIdentity.key(value));
+    }
+
+    /**
+     * Resolves a name against the innermost lambda that declares it. A lambda
+     * parameter shadows outer variables, so falling back to the callable-wide
+     * alias table here would reuse another lambda's element type.
+     */
+    // 作用：解析变量名别名；逻辑：最近 lambda 参数优先，其次回退到可调用体级别名。
+    private String aliasFor(NameExpr name) {
+        String declaredName = name.getNameAsString();
+        for (com.github.javaparser.ast.Node node = name.getParentNode().orElse(null);
+             node != null;
+             node = node.getParentNode().orElse(null)) {
+            if (!(node instanceof LambdaExpr lambda)) {
+                continue;
+            }
+            for (Parameter parameter : lambda.getParameters()) {
+                if (!parameter.getNameAsString().equals(declaredName)) {
+                    continue;
+                }
+                Map<String, String> scoped = lambdaAliases.get(lambdaKey(lambda));
+                String alias = scoped == null ? null : scoped.get(declaredName);
+                return alias == null ? declaredName : alias;
+            }
+        }
+        return applyAlias(declaredName);
     }
 
     // 作用：生成展示文本；逻辑：优先返回语义键，普通调用仅显示方法名与参数个数。
@@ -565,7 +804,12 @@ public final class JavaValueFlowContext {
         }
         if (scope instanceof NameExpr name) {
             String root = name.getNameAsString();
-            if (variableTypes.containsKey(root) || variableTypes.containsKey("this." + root)) {
+            if (declaredType(name) != null
+                    || variableTypes.containsKey(root)
+                    || variableTypes.containsKey("this." + root)) {
+                return true;
+            }
+            if (isCurrentTypeName(root) && hasField(field.getNameAsString())) {
                 return true;
             }
             // A non-declared root is normally a package or a static type. It
@@ -573,6 +817,19 @@ public final class JavaValueFlowContext {
             return false;
         }
         return true;
+    }
+
+    // 作用：判断名称是否为当前声明类型；逻辑：比较简单名与全限定名，覆盖 Outer.Inner 的简单名场景。
+    private boolean isCurrentTypeName(String name) {
+        if (declaringTypeQname == null || name == null || name.isBlank()) {
+            return false;
+        }
+        if (declaringTypeQname.equals(name)) {
+            return true;
+        }
+        int dot = declaringTypeQname.lastIndexOf('.');
+        String simple = dot < 0 ? declaringTypeQname : declaringTypeQname.substring(dot + 1);
+        return simple.equals(name);
     }
 
     /**
@@ -630,17 +887,39 @@ public final class JavaValueFlowContext {
         if (!ELEMENT_READ_METHODS.contains(call.getNameAsString()) || call.getScope().isEmpty()) {
             return null;
         }
-        String root = rootName(call.getScope().orElseThrow());
-        if (root == null || !isContainerRoot(root)) {
+        Expression receiver = call.getScope().orElseThrow();
+        String root = rootName(receiver);
+        if (root != null && isContainerRoot(root)) {
+            if (Set.of("values", "keySet", "entrySet").contains(call.getNameAsString())) {
+                return root + "." + call.getNameAsString() + "[*]";
+            }
+            if (isMapRoot(root) && call.getArguments().size() == 1) {
+                return root + "[" + mapKey(call.getArgument(0)) + "]";
+            }
+            return root + "[*]";
+        }
+        // Chained element access such as bean.getItems().get(0) or
+        // bean.getIndex().get(key): the receiver is not a bare container root
+        // but its resolved type is a container. Keep the element on the
+        // receiver's field path instead of degrading to a call identity.
+        String receiverType = resolveReceiverType(receiver);
+        if (receiverType == null || !isContainerType(receiverType)) {
             return null;
         }
         if (Set.of("values", "keySet", "entrySet").contains(call.getNameAsString())) {
-            return root + "." + call.getNameAsString() + "[*]";
+            return null;
         }
-        if (isMapRoot(root) && call.getArguments().size() == 1) {
-            return root + "[" + mapKey(call.getArgument(0)) + "]";
+        String containerKey = key(receiver);
+        if (containerKey == null || containerKey.isBlank()
+                || containerKey.startsWith("call:")
+                || containerKey.startsWith("new:")
+                || containerKey.startsWith("reference:")) {
+            return null;
         }
-        return root + "[*]";
+        if (isMapType(receiverType) && call.getArguments().size() == 1) {
+            return containerKey + "[" + mapKey(call.getArgument(0)) + "]";
+        }
+        return elementKeyForContainer(containerKey);
     }
 
     /**
@@ -765,13 +1044,14 @@ public final class JavaValueFlowContext {
         if (call.getScope().isEmpty()) {
             return null;
         }
-        String root = rootName(call.getScope().orElseThrow());
-        if (root == null || !isContainerRoot(root)) {
+        Expression receiver = call.getScope().orElseThrow();
+        String root = containerReceiverKey(receiver);
+        if (root == null) {
             return null;
         }
         String name = call.getNameAsString();
         int arity = call.getArguments().size();
-        if (isMapRoot(root)) {
+        if (receiverIsMap(receiver, root)) {
             if ("put".equals(name) && arity == 2) {
                 return root + "[" + mapKey(call.getArgument(0)) + "]";
             }
@@ -791,8 +1071,8 @@ public final class JavaValueFlowContext {
         if (call.getScope().isEmpty()) {
             return null;
         }
-        String root = rootName(call.getScope().orElseThrow());
-        if (root == null || !isContainerRoot(root)) {
+        String root = containerReceiverKey(call.getScope().orElseThrow());
+        if (root == null) {
             return null;
         }
         if (!Set.of("addAll", "putAll").contains(call.getNameAsString())
@@ -800,6 +1080,50 @@ public final class JavaValueFlowContext {
             return null;
         }
         return root + "[*]";
+    }
+
+    /**
+     * Resolves the stable key of a mutated container. A parameter or local is
+     * addressed by its root name, while a field such as {@code this.attachments}
+     * has no container-typed root (`this`) and must use the declared field type
+     * instead.
+     */
+    // 作用：解析容器写入的接收者键；逻辑：变量根优先，否则按字段路径的声明类型判断。
+    private String containerReceiverKey(Expression receiver) {
+        String root = rootName(receiver);
+        if (root != null && isContainerRoot(root)) {
+            return root;
+        }
+        String key = key(receiver);
+        if (key == null || key.isBlank()) {
+            return null;
+        }
+        String type = variableTypes.get(key);
+        if (type == null && receiver instanceof FieldAccessExpr field) {
+            String name = field.getNameAsString();
+            type = variableTypes.get("this." + name);
+            if (type == null) {
+                type = variableTypes.get(name);
+            }
+        }
+        return isContainerType(type) ? key : null;
+    }
+
+    // 作用：判断容器接收者是否为 Map；逻辑：变量根按声明类型判断，字段路径回退到字段类型。
+    private boolean receiverIsMap(Expression receiver, String containerKey) {
+        String root = rootName(receiver);
+        if (root != null && isContainerRoot(root)) {
+            return isMapRoot(root);
+        }
+        String type = variableTypes.get(containerKey);
+        if (type == null && receiver instanceof FieldAccessExpr field) {
+            String name = field.getNameAsString();
+            type = variableTypes.get("this." + name);
+            if (type == null) {
+                type = variableTypes.get(name);
+            }
+        }
+        return isMapType(type);
     }
 
     // 作用：生成容器元素键；逻辑：已带元素标记时原样返回，否则补元素后缀。
@@ -859,6 +1183,30 @@ public final class JavaValueFlowContext {
         return variableTypes.get(value);
     }
 
+    // 作用：查询表达式声明类型；逻辑：lambda 参数取所属 lambda 的作用域类型，其余回退变量表。
+    public String declaredType(NameExpr name) {
+        String declaredName = name.getNameAsString();
+        for (com.github.javaparser.ast.Node node = name.getParentNode().orElse(null);
+             node != null;
+             node = node.getParentNode().orElse(null)) {
+            if (!(node instanceof LambdaExpr lambda)) {
+                continue;
+            }
+            for (Parameter parameter : lambda.getParameters()) {
+                if (!parameter.getNameAsString().equals(declaredName)) {
+                    continue;
+                }
+                Map<String, String> scoped = lambdaTypes.get(lambdaKey(lambda));
+                return scoped == null ? null : scoped.get(declaredName);
+            }
+            Map<String, String> locals = lambdaLocalTypes.get(lambdaKey(lambda));
+            if (locals != null && locals.containsKey(declaredName)) {
+                return locals.get(declaredName);
+            }
+        }
+        return variableTypes.get(declaredName);
+    }
+
     /**
      * Declared types for parameters, locals, fields and inferred lambda
      * parameters. Call resolution uses the same view as value-flow so a lambda
@@ -883,22 +1231,197 @@ public final class JavaValueFlowContext {
         return dot < 0 ? type : type.substring(dot + 1);
     }
 
-    // 作用：判断访问器是否有字段证据；逻辑：无接收者类型时沿用名称规则，有类型时要求字段存在且非 JDK 值类型。
+    /**
+     * Evidence tiers for a JavaBean accessor.
+     *
+     * <p>{@code PROVEN} means the receiver type is either part of the analysed
+     * sources (declared field set) or present in the supplied classpath and
+     * declares the property/accessor. {@code REFUTED} means the type is fully
+     * known and has neither the field nor the accessor, so no field node may be
+     * created. {@code UNVERIFIED} means the receiver type or its hierarchy is
+     * not available; the accessor path is kept, but it is reported as an
+     * external boundary instead of silently pretending to be a field.</p>
+     */
+    // 作用：标记访问器证据等级；逻辑：区分已证明、已否定与无法证明三种状态。
+    public enum AccessorEvidence {
+        PROVEN,
+        REFUTED,
+        UNVERIFIED
+    }
+
+    // 作用：判断访问器是否有字段证据；逻辑：仅排除已否定的访问器，无法证明时保留路径并在后续标注边界。
     private boolean hasAccessorEvidence(MethodCallExpr call, String property) {
+        return accessorEvidence(call, property) != AccessorEvidence.REFUTED;
+    }
+
+    /**
+     * True when this getter looks like a field read but the receiver type could
+     * not be verified. Extraction keeps the field path so the trace can show
+     * exactly which accessor stopped, while the node is published with an
+     * external boundary reason instead of an unexplained UNKNOWN.
+     */
+    // 作用：判断是否为未经证明的外部访问器；逻辑：参数为空、可解析为属性且证据等级为 UNVERIFIED。
+    public boolean isUnverifiedAccessor(MethodCallExpr call) {
+        if (call == null || !call.getArguments().isEmpty()) {
+            return false;
+        }
+        String property = AccessorFieldIdentity.propertyFromAccessor(call.getNameAsString(), true);
+        if (property == null) {
+            property = directFieldProperty(call, true);
+        }
+        return property != null
+                && accessorEvidence(call, property) == AccessorEvidence.UNVERIFIED;
+    }
+
+    // 作用：给出外部访问器的边界原因；逻辑：classpath 已含该类型时标为外部库，否则标为缺少 classpath。
+    public String unverifiedAccessorReason(MethodCallExpr call) {
+        String receiverType = resolveReceiverType(call.getScope().orElse(null));
+        if (receiverType != null && classpathTypes != null) {
+            for (String candidate : externalCandidateTypes(receiverType)) {
+                if (classpathTypes.hasType(candidate)) {
+                    return "EXTERNAL_LIBRARY";
+                }
+            }
+        }
+        return "CLASSPATH_MISSING";
+    }
+
+    // 作用：判定访问器证据；逻辑：源码类型查字段集，外部类型查 classpath 元数据与继承链。
+    private AccessorEvidence accessorEvidence(MethodCallExpr call, String property) {
+        if (isLoggerReceiver(call)) {
+            return AccessorEvidence.REFUTED;
+        }
         String receiverType = resolveReceiverType(call.getScope().orElse(null));
         if (receiverType == null || receiverType.isBlank()) {
             // Without a type, preserve the previous name-based fallback. The
             // graph can still be inspected as an unresolved call candidate.
-            return true;
+            return AccessorEvidence.UNVERIFIED;
         }
         if (typeCatalog != null && typeCatalog.type(receiverType) != null) {
-            return typeCatalog.fieldNames(receiverType).stream()
+            boolean declared = typeCatalog.fieldNames(receiverType).stream()
                     .map(AccessorFieldIdentity::canonicalPropertyName)
                     .anyMatch(property::equals);
+            return declared ? AccessorEvidence.PROVEN : AccessorEvidence.REFUTED;
         }
         // JDK value methods (Date.getTime, BigDecimal.scale, ...) are
         // conversions, not JavaBean field reads.
-        return !JavaValueTypes.isValueType(receiverType);
+        if (JavaValueTypes.isValueType(receiverType)) {
+            return AccessorEvidence.REFUTED;
+        }
+        if (classpathTypes == null) {
+            return AccessorEvidence.UNVERIFIED;
+        }
+        List<String> candidates = externalCandidateTypes(receiverType);
+        if (candidates.isEmpty()) {
+            return AccessorEvidence.UNVERIFIED;
+        }
+        boolean unknownAncestor = false;
+        boolean fullyKnown = false;
+        for (String candidate : candidates) {
+            Boolean found = externalProperty(candidate, property, 0, new java.util.HashSet<>());
+            if (Boolean.TRUE.equals(found)) {
+                return AccessorEvidence.PROVEN;
+            }
+            if (found == null) {
+                unknownAncestor = true;
+            } else {
+                fullyKnown = true;
+            }
+        }
+        return fullyKnown && !unknownAncestor
+                ? AccessorEvidence.REFUTED
+                : AccessorEvidence.UNVERIFIED;
+    }
+
+    // 作用：识别日志对象；逻辑：按常见日志变量名与 Log/Logger 类型名判定，避免日志级别判断生成字段。
+    private boolean isLoggerReceiver(MethodCallExpr call) {
+        Expression scope = unwrap(call.getScope().orElse(null));
+        if (scope instanceof NameExpr name) {
+            String identifier = name.getNameAsString();
+            if ("log".equals(identifier) || "logger".equals(identifier)
+                    || "LOG".equals(identifier) || "LOGGER".equals(identifier)
+                    || "_log".equals(identifier) || "businessLogger".equals(identifier)
+                    || "logUtil".equals(identifier)) {
+                return true;
+            }
+        }
+        String receiverType = resolveReceiverType(scope);
+        if (receiverType == null) {
+            return false;
+        }
+        String simple = simpleType(receiverType);
+        return "Log".equals(simple) || "Logger".equals(simple) || simple.endsWith("Logger");
+    }
+
+    // 作用：在 classpath 继承链中查属性；逻辑：先查字段，再查无参 get/is 方法，父类型不可读时返回 null。
+    private Boolean externalProperty(
+            String qname,
+            String property,
+            int depth,
+            Set<String> visited
+    ) {
+        if (qname == null || depth > 8 || !visited.add(qname)) {
+            return Boolean.FALSE;
+        }
+        ClassFileMetadata metadata = classpathTypes.type(qname);
+        if (metadata == null) {
+            return null;
+        }
+        /*
+         * Only an actual field proves that this accessor path is a field read.
+         * A getter alone does not: frameworks such as commons-logging expose
+         * {@code isDebugEnabled()} with no backing property, and interfaces
+         * such as HttpServletRequest declare {@code getMethod()} without a
+         * {@code method} field. Accepting the getter as proof published phantom
+         * FIELD nodes ({@code log.debugEnabled}, {@code request.method}) that
+         * polluted both the graph and generated audit targets.
+         */
+        boolean field = metadata.fieldNames().stream()
+                .map(AccessorFieldIdentity::canonicalPropertyName)
+                .anyMatch(property::equals);
+        if (field) {
+            return Boolean.TRUE;
+        }
+        boolean complete = true;
+        String superName = metadata.superName();
+        if (superName != null && !"java.lang.Object".equals(superName)) {
+            Boolean parent = externalProperty(superName, property, depth + 1, visited);
+            if (Boolean.TRUE.equals(parent)) {
+                return Boolean.TRUE;
+            }
+            if (parent == null) {
+                complete = false;
+            }
+        }
+        for (String interfaceName : metadata.interfaces()) {
+            Boolean parent = externalProperty(interfaceName, property, depth + 1, visited);
+            if (Boolean.TRUE.equals(parent)) {
+                return Boolean.TRUE;
+            }
+            if (parent == null) {
+                complete = false;
+            }
+        }
+        return complete ? Boolean.FALSE : null;
+    }
+
+    // 作用：列出外部类型候选全名；逻辑：优先用显式导入解析，缺失编译单元时退回规范化类型名。
+    private List<String> externalCandidateTypes(String receiverType) {
+        String normalized = JavaTypeNameResolver.normalize(receiverType);
+        if (normalized == null || normalized.isBlank()) {
+            return List.of();
+        }
+        if (typeCatalog == null) {
+            return List.of(normalized);
+        }
+        com.github.javaparser.ast.CompilationUnit unit =
+                callable.findCompilationUnit().orElse(null);
+        if (unit == null) {
+            return List.of(normalized);
+        }
+        List<String> candidates = new JavaTypeNameResolver(typeCatalog)
+                .externalCandidates(unit, normalized);
+        return candidates.isEmpty() ? List.of(normalized) : candidates;
     }
 
     // 作用：限定访问器字段路径；逻辑：接收者键加属性名，接收者为空时用 this。
@@ -926,7 +1449,7 @@ public final class JavaValueFlowContext {
             return declaringTypeQname;
         }
         if (value instanceof NameExpr name) {
-            return resolveDeclaredType(variableTypes.get(name.getNameAsString()));
+            return resolveDeclaredType(declaredType(name));
         }
         if (value instanceof FieldAccessExpr field && field.getScope().isThisExpr()) {
             return resolveDeclaredType(variableTypes.get(field.getNameAsString()));
@@ -1054,8 +1577,5 @@ public final class JavaValueFlowContext {
     }
 
     public record StreamChain(Expression source, List<MethodCallExpr> stages) {
-    }
-
-    private record LambdaAliasCandidate(String root, String parameter) {
     }
 }

@@ -50,6 +50,14 @@ public final class SourceTypeCatalog {
     private final Map<String, Map<String, String>> serializedFieldToFieldByType;
     private final Map<String, Map<String, Set<String>>> fieldAliasesByType;
     private final Map<String, Set<String>> ignoredSerializedFieldsByType;
+    /**
+     * Merged own + inherited field types. Typical DAO/service hierarchies
+     * declare the collaborator on a base class
+     * ({@code BaseDao.sqlMapClientTemplate}); without the inherited entry the
+     * receiver type is unknown and every call becomes a weak hop.
+     */
+    private final Map<String, Map<String, String>> fieldTypesByHierarchy =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     // 作用：保存源码类型目录的全部索引；逻辑：直接持有构造阶段生成的不可变映射。
     private SourceTypeCatalog(
@@ -345,6 +353,40 @@ public final class SourceTypeCatalog {
     // 作用：在继承链中查询字段类型；逻辑：初始化访问集合后递归查找。
     public String fieldTypeInHierarchy(String typeQname, String fieldName) {
         return fieldTypeInHierarchy(typeQname, fieldName, new HashSet<>());
+    }
+
+    // 作用：汇总本类与父类字段类型；逻辑：按子类优先合并并缓存结果。
+    public Map<String, String> fieldTypesInHierarchy(String typeQname) {
+        if (typeQname == null || typeQname.isBlank()) {
+            return Map.of();
+        }
+        return fieldTypesByHierarchy.computeIfAbsent(typeQname, key -> {
+            Map<String, String> merged = new LinkedHashMap<>();
+            collectFieldTypes(key, merged, new HashSet<>());
+            return Map.copyOf(merged);
+        });
+    }
+
+    // 作用：递归收集字段类型；逻辑：先放本类字段，再沿父类型补缺失项并防止循环。
+    private void collectFieldTypes(
+            String typeQname,
+            Map<String, String> merged,
+            Set<String> visited
+    ) {
+        if (typeQname == null || !visited.add(typeQname)) {
+            return;
+        }
+        Map<String, String> fields = fieldTypesByType.get(typeQname);
+        if (fields != null) {
+            fields.forEach(merged::putIfAbsent);
+        }
+        TypeInfo type = types.get(typeQname);
+        if (type == null) {
+            return;
+        }
+        for (String superType : type.superTypes()) {
+            collectFieldTypes(superType, merged, visited);
+        }
     }
 
     // 作用：递归查找字段类型；逻辑：先查当前类型字段，未命中再沿父类型查找并防止循环。

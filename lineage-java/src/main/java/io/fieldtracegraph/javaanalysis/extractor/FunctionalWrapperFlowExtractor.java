@@ -21,6 +21,7 @@ import io.fieldtracegraph.javaanalysis.flow.JavaValueFlowContext;
 import io.fieldtracegraph.javaanalysis.resolution.AccessorFieldIdentity;
 
 import java.util.List;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -37,7 +38,8 @@ import java.util.Set;
  */
 public final class FunctionalWrapperFlowExtractor {
     private static final Set<String> CALLBACK_METHODS = Set.of(
-            "map", "flatMap", "filter", "thenApply", "thenCompose", "handle"
+            "map", "flatMap", "filter", "thenApply", "thenCompose", "handle",
+            "ifPresent", "ifPresentOrElse", "forEach"
     );
     private static final Set<String> WRAPPER_TYPES = Set.of(
             "Optional", "OptionalInt", "OptionalLong", "OptionalDouble",
@@ -48,6 +50,9 @@ public final class FunctionalWrapperFlowExtractor {
     );
     private static final Set<String> TERMINAL_METHODS = Set.of(
             "orElse", "orElseGet", "orElseThrow", "join", "get", "getNow"
+    );
+    private static final Set<String> CONSUMER_METHODS = Set.of(
+            "ifPresent", "ifPresentOrElse", "forEach"
     );
 
     private final ValueEdgeEmitter edgeEmitter = new ValueEdgeEmitter();
@@ -106,7 +111,8 @@ public final class FunctionalWrapperFlowExtractor {
                 continue;
             }
             ValueNodeRecord parameterNode = nodeCatalog.ensure(
-                    source, scope, nodes, accumulator, parameter, "LAMBDA_PARAMETER", lambda
+                    source, scope, nodes, accumulator,
+                    context.lambdaParameterKey(lambda, 0), "LAMBDA_PARAMETER", lambda
             );
             if (!sourceNode.valueId().equals(parameterNode.valueId())) {
                 edgeEmitter.addEdge(
@@ -114,6 +120,14 @@ public final class FunctionalWrapperFlowExtractor {
                         "CONTAINER_FLOW", "functional wrapper parameter",
                         lambda, ordinal++
                 );
+            }
+            if (CONSUMER_METHODS.contains(call.getNameAsString())) {
+                ordinal = emitParameterFieldBridges(
+                        source, scope, nodes, accumulator,
+                        sourceElement, parameter, parameterKey,
+                        lambda, ordinal
+                );
+                continue;
             }
             if ("filter".equals(call.getNameAsString())) {
                 continue;
@@ -194,6 +208,77 @@ public final class FunctionalWrapperFlowExtractor {
                         "ASSIGNED_FROM", "functional wrapper origin", anchor, ordinal++
                 );
             }
+        }
+        return ordinal;
+    }
+
+    /**
+     * Consumer callbacks ({@code ifPresent}, {@code forEach}, ...) return no
+     * value, so the mapped-field projection above cannot run. The lambda
+     * parameter is still the same object as the wrapped element; bridge its
+     * field reads back to the source element so {@code optional.ifPresent(v ->
+     * use(v.getId()))} keeps {@code bean.id} reachable.
+     */
+    // 作用：连接消费者回调参数字段；逻辑：把参数下已登记的字段节点投影回源元素的同名字段。
+    private int emitParameterFieldBridges(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            String sourceElement,
+            String parameter,
+            String parameterAlias,
+            Node anchor,
+            int ordinal
+    ) {
+        if (sourceElement == null || sourceElement.isBlank()
+                || parameter == null || parameter.isBlank()) {
+            return ordinal;
+        }
+        List<String> prefixes = parameterAlias == null || parameterAlias.isBlank()
+                || parameterAlias.equals(parameter)
+                ? List.of(parameter + ".")
+                : List.of(parameter + ".", parameterAlias + ".");
+        List<String> parameterFields = nodes.keySet().stream()
+                .filter(key -> prefixes.stream().anyMatch(
+                        prefix -> key.startsWith(prefix) && key.length() > prefix.length()))
+                .toList();
+        Set<String> bridged = new HashSet<>();
+        for (String parameterField : parameterFields) {
+            String suffix = parameterField.substring(
+                    prefixes.stream()
+                            .filter(parameterField::startsWith)
+                            .mapToInt(String::length)
+                            .max()
+                            .orElse(parameter.length() + 1)
+            );
+            String originKey = sourceElement + "." + suffix;
+            boolean originExisted = nodes.containsKey(originKey);
+            ValueNodeRecord origin = nodeCatalog.ensure(
+                    source, scope, nodes, accumulator, originKey, null, anchor
+            );
+            ValueNodeRecord target = nodes.get(parameterField);
+            if (target == null || origin.valueId().equals(target.valueId())) {
+                continue;
+            }
+            if (!bridged.add(origin.canonicalValue() + "->" + target.canonicalValue())) {
+                continue;
+            }
+            if (!originExisted) {
+                ValueNodeRecord sourceRoot = nodeCatalog.ensure(
+                        source, scope, nodes, accumulator, sourceElement, null, anchor
+                );
+                edgeEmitter.addEdge(
+                        source, scope, accumulator, sourceRoot, origin,
+                        "FIELD_READ", "functional wrapper element field",
+                        anchor, ordinal++
+                );
+            }
+            edgeEmitter.addEdge(
+                    source, scope, accumulator, origin, target,
+                    "ASSIGNED_FROM", "functional wrapper parameter field",
+                    anchor, ordinal++
+            );
         }
         return ordinal;
     }

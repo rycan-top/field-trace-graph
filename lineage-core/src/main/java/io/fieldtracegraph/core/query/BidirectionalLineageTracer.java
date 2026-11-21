@@ -274,6 +274,26 @@ public final class BidirectionalLineageTracer {
                         .sorted(Comparator.comparing(path -> String.join(".", path)))
                         .forEach(path -> expansion.add(new ValueRef(rootId, path)));
             }
+            /*
+             * A field that is itself a container (`this.attachments`) has no
+             * object node to expand through. Seed its element/descendant
+             * nodes so `map.put(...)` and `list.add(...)` are visible when the
+             * target is the container field as a whole.
+             */
+            ValueNodeRecord concrete = nodesById.get(resolved.nodeId());
+            if (concrete != null && !concrete.accessPath().isEmpty()
+                    && concrete.canonicalValue() != null) {
+                String base = concrete.canonicalValue();
+                nodesByScope.getOrDefault(concrete.scopeSymbolId(), List.of()).stream()
+                        .filter(node -> !node.valueId().equals(concrete.valueId()))
+                        .filter(node -> node.canonicalValue() != null)
+                        .filter(node -> node.canonicalValue().startsWith(base + ".")
+                                || node.canonicalValue().startsWith(base + "["))
+                        .filter(node -> evidenceNodeIds.contains(node.valueId()))
+                        .sorted(Comparator.comparing(ValueNodeRecord::canonicalValue)
+                                .thenComparingInt(ValueNodeRecord::lineStart))
+                        .forEach(node -> expansion.add(new ValueRef(node.valueId(), List.of())));
+            }
         }
         return expansion;
     }
@@ -299,7 +319,13 @@ public final class BidirectionalLineageTracer {
             return;
         }
         String rootName = selected.rootName();
-        Set<String> matchingScopes = new HashSet<>();
+        /*
+         * Match each field node to the object root that owns it. Two lambdas
+         * in one method may both declare a parameter named {@code k}; adding
+         * every same-named root invented {@code k.channelId} on the second,
+         * unrelated lambda.
+         */
+        Map<String, ValueNodeRecord> owners = new LinkedHashMap<>();
         for (ValueNodeRecord field : graph.valueNodes()) {
             if (expansion.stopped()) {
                 return;
@@ -307,20 +333,54 @@ public final class BidirectionalLineageTracer {
             if ("FIELD".equals(field.valueKind())
                     && rootName.equals(field.rootName())
                     && resolved.fields().equals(field.accessPath())) {
-                matchingScopes.add(field.scopeSymbolId());
+                ValueNodeRecord owner = owningRoot(graph, field, rootName);
+                if (owner != null) {
+                    owners.putIfAbsent(owner.valueId(), owner);
+                }
             }
         }
-        for (ValueNodeRecord root : graph.valueNodes()) {
+        for (ValueNodeRecord root : owners.values()) {
             if (expansion.stopped()) {
                 return;
             }
-            if (!matchingScopes.contains(root.scopeSymbolId())
+            expansion.add(new ValueRef(root.valueId(), resolved.fields()));
+        }
+    }
+
+    /**
+     * Finds the declaration a field node belongs to: the nearest preceding
+     * same-named object root in the same scope. Logical field nodes without a
+     * usable offset fall back to the earliest root of that name.
+     */
+    // 作用：定位字段所属对象根；逻辑：同作用域内取不晚于字段声明位置的最近同名根。
+    private ValueNodeRecord owningRoot(
+            LineageGraph graph,
+            ValueNodeRecord field,
+            String rootName
+    ) {
+        ValueNodeRecord nearest = null;
+        ValueNodeRecord earliest = null;
+        for (ValueNodeRecord root : graph.valueNodes()) {
+            if (!field.scopeSymbolId().equals(root.scopeSymbolId())
                     || !rootName.equals(root.canonicalValue())
                     || root.accessPath() != null && !root.accessPath().isEmpty()) {
                 continue;
             }
-            expansion.add(new ValueRef(root.valueId(), resolved.fields()));
+            if (earliest == null
+                    || root.declarationOffset() < earliest.declarationOffset()) {
+                earliest = root;
+            }
+            if (root.declarationOffset() > field.declarationOffset()) {
+                continue;
+            }
+            if (nearest == null
+                    || root.declarationOffset() > nearest.declarationOffset()
+                    || (root.declarationOffset() == nearest.declarationOffset()
+                    && root.definitionOrdinal() > nearest.definitionOrdinal())) {
+                nearest = root;
+            }
         }
+        return nearest == null ? earliest : nearest;
     }
 
     // 作用：枚举节点上的字段访问路径；逻辑：从字段展开索引提取路径并去重。
@@ -425,7 +485,7 @@ public final class BidirectionalLineageTracer {
         TraversalFrontier frontier = new TraversalFrontier();
         Deque<ValueRef> queue = new ArrayDeque<>();
         for (ValueRef target : targets) {
-            frontier.visited.add(target);
+            frontier.offer(target);
             frontier.depth.put(target, 0);
             state.visited.add(target);
             if (backward) {
@@ -509,7 +569,7 @@ public final class BidirectionalLineageTracer {
     ) {
         Deque<ValueRef> queue = new ArrayDeque<>();
         for (ValueRef target : targets) {
-            frontier.visited.add(target);
+            frontier.offer(target);
             frontier.depth.put(target, 0);
             state.visited.add(target);
             if (backward) {

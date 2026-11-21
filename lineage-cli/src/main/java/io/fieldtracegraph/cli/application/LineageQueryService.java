@@ -30,6 +30,7 @@ import io.fieldtracegraph.javaanalysis.semantic.context.SemanticContextFingerpri
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +46,46 @@ import java.util.stream.Collectors;
  * never initialises or synchronises the index.
  */
 public class LineageQueryService {
+    private static final long SOURCE_SCAN_TTL_MILLIS = 5 * 60 * 1000L;
+    private static final Set<String> EXPANDED_FACTORY_TYPES = Set.of(
+            "Pair", "ImmutablePair", "MutablePair",
+            "Triple", "ImmutableTriple", "MutableTriple",
+            "KeyValue", "Quartet", "Quintet", "Sextet", "Septet", "Octet",
+            "Ennead", "Decade", "Tuple", "Tuples",
+            "Tuple2", "Tuple3", "Tuple4", "Tuple5", "Tuple6", "Tuple7", "Tuple8",
+            "List", "Set", "Map", "ImmutableMap", "ImmutableList", "ImmutableSet",
+            "ImmutableSortedSet", "ImmutableSortedMap", "Collections", "Arrays",
+            "Lists", "Sets", "Maps", "Optional", "OptionalInt", "OptionalLong",
+            "OptionalDouble", "CompletableFuture", "CompletionStage", "Future",
+            "AtomicReference"
+    );
+    private static final Set<String> EXPANDED_FACTORY_METHODS = Set.of(
+            "of", "with", "entry", "asList", "singletonList", "singleton",
+            "unmodifiableList", "unmodifiableSet", "unmodifiableMap", "copyOf",
+            "ofNullable", "newArrayList", "newLinkedList", "newHashSet",
+            "newLinkedHashSet", "newHashMap", "newLinkedHashMap", "newTreeMap",
+            "newTreeSet", "ofEntries", "singletonMap", "emptyList", "emptySet",
+            "emptyMap", "orElse", "orElseGet", "orElseThrow", "join", "get",
+            "getNow", "completedFuture", "supplyAsync", "runAsync"
+    );
+    private static final Set<String> EXPANDED_WRAPPER_METHODS = Set.of(
+            "map", "flatMap", "filter", "thenApply", "thenCompose", "handle",
+            "ifPresent", "ifPresentOrElse", "thenAccept", "thenRun", "whenComplete"
+    );
+    private static final Set<String> EXPANDED_WRAPPER_TYPES = Set.of(
+            "Optional", "OptionalInt", "OptionalLong", "OptionalDouble",
+            "CompletableFuture", "CompletionStage", "Future", "AtomicReference"
+    );
+    private static final Set<String> EXPANDED_UTILITY_TYPES = Set.of(
+            "StringUtils", "CollectionUtils", "ObjectUtils", "NumberUtils",
+            "BooleanUtils", "ArrayUtils", "MapUtils", "Objects"
+    );
+    private static final Set<String> EXPANDED_CONSTRUCTOR_TYPES = Set.of(
+            "ArrayList", "LinkedList", "Vector", "Stack", "ArrayDeque",
+            "PriorityQueue", "CopyOnWriteArrayList", "HashSet", "LinkedHashSet",
+            "TreeSet", "HashMap", "LinkedHashMap", "TreeMap", "Hashtable",
+            "WeakHashMap", "EnumMap", "IdentityHashMap", "ConcurrentHashMap"
+    );
     private final GraphSnapshotReader snapshotReader;
     private final ProjectSourceReader sourceReader;
     private final SemanticContextFingerprint contextFingerprint = new SemanticContextFingerprint();
@@ -53,6 +94,35 @@ public class LineageQueryService {
     private final ReachableScopeCollector scopeCollector;
     private final ProjectContractLoader contractLoader = new ProjectContractLoader();
     private final ManualContractEvidence manualContractEvidence = new ManualContractEvidence();
+    private Path capturedRoot;
+    private SourceScanOptions capturedOptions;
+    private long capturedAtMillis;
+    private List<SourceFileRecord> capturedFiles;
+    /*
+     * Batch audits ask one question per field, and a method with N fields
+     * repeats the same cone load N times. The cone depends only on the scope
+     * set and the index generation, so a two-entry cache removes the repeated
+     * node/edge/evidence reads without changing what any single trace sees.
+     */
+    private final Map<String, ConeSnapshot> coneCache =
+            new LinkedHashMap<>(4, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ConeSnapshot> eldest) {
+                    return size() > 2;
+                }
+            };
+
+    private record ConeSnapshot(
+            List<ValueNodeRecord> valueNodes,
+            List<DataEdgeRecord> dataEdges,
+            List<EdgeEvidence> edgeEvidence,
+            List<io.fieldtracegraph.core.model.CallEdgeRecord> callEdges,
+            List<MethodSummaryRecord> methodSummaries,
+            List<io.fieldtracegraph.core.model.PendingRefRecord> pendingRefs,
+            Map<String, SourceFileRecord> sourceFiles,
+            Map<String, String> scopeQnames
+    ) {
+    }
 
     // 作用：注入查询依赖；逻辑：保存快照读取器、源采集器与运行配置，并创建可达作用域收集器。
     public LineageQueryService(
@@ -81,6 +151,7 @@ public class LineageQueryService {
             boolean includeDependencies,
             boolean strictContracts
     ) {
+        options = ClasspathDiscovery.discover(root, options);
         io.fieldtracegraph.core.query.TraversalBudget budget = TraceBudgetPolicy.resolve(
                 targetExpression, maxDepth, maxEdges, queryTimeoutMillis);
         boolean adaptive = maxEdges == -1;
@@ -117,50 +188,48 @@ public class LineageQueryService {
     ) {
         LineageQuery query = LineageQuery.of(direction, budget);
         CallScopeMode resolvedCallScope = callScope == null ? CallScopeMode.EFFECTIVE : callScope;
+        long deadline = budget.deadlineNanos();
+        long phaseStart = System.nanoTime();
         try (GraphReadSession session = snapshotReader.open(ProjectIndexPaths.databasePath(root))) {
+            session.setDeadlineNanos(deadline);
+            phaseStart = profile("open", phaseStart);
             var method = session.findMethodBySelector(methodSelector);
             if (method == null) {
                 throw new IllegalArgumentException("METHOD_NOT_FOUND");
             }
+            phaseStart = profile("method", phaseStart);
             Set<String> scopeIds = collectScopes(
                     session,
                     method.methodId(),
                     resolvedCallScope,
                     direction
             );
-            List<ValueNodeRecord> valueNodes = session.valueNodesForScopeIds(new ArrayList<>(scopeIds));
-            List<DataEdgeRecord> dataEdges = session.dataEdgesForScopeIds(new ArrayList<>(scopeIds)).stream()
-                    .filter(edge -> includeDependencies || !edge.dependencyOnly())
-                    .toList();
-            List<EdgeEvidence> edgeEvidence = new ArrayList<>(
-                    session.edgeEvidenceForScopeIds(new ArrayList<>(scopeIds))
-            );
-            ProjectContracts contracts = contractLoader.load(root, strictContracts);
-            edgeEvidence.addAll(manualContractEvidence.apply(
-                    contracts, dataEdges, valueNodes, strictContracts));
-            List<CallEdgeRecord> callEdges = session.callEdgesForScopeIds(new ArrayList<>(scopeIds));
-            List<MethodSummaryRecord> methodSummaries =
-                    session.methodSummariesForScopeIds(new ArrayList<>(scopeIds));
-            List<PendingRefRecord> pendingRefs = session.pendingRefsForScopeIds(new ArrayList<>(scopeIds));
-            Set<String> fileIds = new LinkedHashSet<>();
-            for (DataEdgeRecord edge : dataEdges) {
-                fileIds.add(edge.fileId());
+            phaseStart = profile("scopes=" + scopeIds.size(), phaseStart);
+            ensureWithinDeadline(budget, deadline, "scope collection");
+            List<String> scopeIdList = new ArrayList<>(scopeIds);
+            String coneKey = session.generation() + "|" + strictContracts + "|"
+                    + String.join("\u0001", scopeIdList);
+            ConeSnapshot cone;
+            synchronized (coneCache) {
+                cone = coneCache.get(coneKey);
             }
-            for (CallEdgeRecord edge : callEdges) {
-                fileIds.add(edge.fileId());
+            long coneStart = System.nanoTime();
+            if (cone == null) {
+                cone = loadCone(session, root, options, scopeIdList, strictContracts, budget, deadline);
+                synchronized (coneCache) {
+                    coneCache.put(coneKey, cone);
+                }
             }
-            for (MethodSummaryRecord summary : methodSummaries) {
-                fileIds.add(summary.fileId());
-            }
-            for (PendingRefRecord ref : pendingRefs) {
-                fileIds.add(ref.fileId());
-            }
-            List<SourceFileRecord> scannedFiles = sourceReader.capture(root, options);
-            Map<String, SourceFileRecord> sourceFiles = withSourceContent(
-                    session.sourceFilesByIds(new ArrayList<>(fileIds)),
-                    scannedFiles
-            );
-            Map<String, String> scopeQnames = session.qnamesBySymbolIds(new ArrayList<>(scopeIds));
+            phaseStart = profile("cone(cached=" + (System.nanoTime() - coneStart < 5_000_000L) + ")", phaseStart);
+            List<ValueNodeRecord> valueNodes = cone.valueNodes();
+            List<DataEdgeRecord> dataEdges = cone.dataEdges();
+            List<EdgeEvidence> edgeEvidence = cone.edgeEvidence();
+            List<CallEdgeRecord> callEdges = cone.callEdges();
+            List<MethodSummaryRecord> methodSummaries = cone.methodSummaries();
+            List<PendingRefRecord> pendingRefs = cone.pendingRefs();
+            Map<String, SourceFileRecord> sourceFiles = cone.sourceFiles();
+            Map<String, String> scopeQnames = cone.scopeQnames();
+            List<SourceFileRecord> scannedFiles = captureSources(root, options);
             LineageGraph graph = new LineageGraph(
                     method,
                     session.generation(),
@@ -172,12 +241,14 @@ public class LineageQueryService {
                     pendingRefs,
                     methodSummaries,
                     sourceFiles,
-                    scopeQnames
+                    scopeQnames,
+                    includeDependencies
             );
             String freshness = computeFreshness(session, scannedFiles, root, options);
+            phaseStart = profile("sources", phaseStart);
             List<AmbiguousCandidate> ambiguousCandidates = ambiguousCandidates(pendingRefs, scopeQnames);
             List<TraceWeakHop> weakHops = weakHops(pendingRefs, scopeQnames, sourceFiles);
-            return tracer.trace(
+            var traceResult = tracer.trace(
                     graph,
                     targetExpression,
                     query.direction(),
@@ -186,6 +257,158 @@ public class LineageQueryService {
                     ambiguousCandidates,
                     weakHops
             );
+            profile("traverse=" + traceResult.edges().size(), phaseStart);
+            return traceResult;
+        } catch (RuntimeException e) {
+            if (budgetInterrupted(e)) {
+                throw new io.fieldtracegraph.core.query.TraceTimeoutException("storage scan");
+            }
+            throw e;
+        }
+    }
+
+    // 作用：判断异常是否由预算中断引起；逻辑：沿 cause 链匹配 SQLite 的 interrupt 文案。
+    private boolean budgetInterrupted(Throwable error) {
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (message != null && message.toLowerCase().contains("interrupt")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*
+     * Loads every row a single trace needs for its call cone. The returned
+     * snapshot is immutable so it can be reused by the next field queried on
+     * the same method without risking cross-case mutation.
+     */
+    private ConeSnapshot loadCone(
+            GraphReadSession session,
+            Path root,
+            SourceScanOptions options,
+            List<String> scopeIdList,
+            boolean strictContracts,
+            io.fieldtracegraph.core.query.TraversalBudget budget,
+            long deadline
+    ) {
+        long phaseStart = System.nanoTime();
+        List<ValueNodeRecord> valueNodes = session.valueNodesForScopeIds(scopeIdList);
+        phaseStart = profile("nodes=" + valueNodes.size(), phaseStart);
+        ensureWithinDeadline(budget, deadline, "value node loading");
+        /*
+         * Keep dependency edges in the graph as field evidence even when they
+         * are not part of the requested value-flow projection. The index uses
+         * them to build field expansions, while traversal only registers them
+         * as steps when --include-dependencies is set.
+         */
+        List<DataEdgeRecord> dataEdges = session.dataEdgesForScopeIds(scopeIdList);
+        phaseStart = profile("edges=" + dataEdges.size(), phaseStart);
+        ensureWithinDeadline(budget, deadline, "data edge loading");
+        /*
+         * Load evidence only for the edges that are actually in memory. A
+         * scope-wide evidence scan of a large repository materialises every
+         * evidence row for every method in the call cone, which both wastes
+         * memory and dominates query time for wide call graphs.
+         */
+        List<String> evidenceIds = dataEdges.stream()
+                .map(DataEdgeRecord::evidenceId)
+                .filter(id -> id != null && !id.isBlank())
+                .distinct()
+                .toList();
+        List<String> edgeIds = dataEdges.stream()
+                .map(DataEdgeRecord::edgeId)
+                .filter(id -> id != null && !id.isBlank())
+                .distinct()
+                .toList();
+        List<EdgeEvidence> edgeEvidence = new ArrayList<>(
+                session.edgeEvidenceForEdgeRefs(evidenceIds, edgeIds)
+        );
+        phaseStart = profile("evidence=" + edgeEvidence.size(), phaseStart);
+        ensureWithinDeadline(budget, deadline, "evidence loading");
+        ProjectContracts contracts = contractLoader.load(root, strictContracts);
+        edgeEvidence.addAll(manualContractEvidence.apply(
+                contracts, dataEdges, valueNodes, strictContracts));
+        List<CallEdgeRecord> callEdges = session.callEdgesForScopeIds(scopeIdList);
+        List<MethodSummaryRecord> methodSummaries = session.methodSummariesForScopeIds(scopeIdList);
+        List<PendingRefRecord> pendingRefs = session.pendingRefsForScopeIds(scopeIdList);
+        phaseStart = profile("callgraph", phaseStart);
+        ensureWithinDeadline(budget, deadline, "call graph loading");
+        Set<String> fileIds = new LinkedHashSet<>();
+        for (DataEdgeRecord edge : dataEdges) {
+            fileIds.add(edge.fileId());
+        }
+        for (CallEdgeRecord edge : callEdges) {
+            fileIds.add(edge.fileId());
+        }
+        for (MethodSummaryRecord summary : methodSummaries) {
+            fileIds.add(summary.fileId());
+        }
+        for (PendingRefRecord ref : pendingRefs) {
+            fileIds.add(ref.fileId());
+        }
+        List<SourceFileRecord> scannedFiles = captureSources(root, options);
+        Map<String, SourceFileRecord> sourceFiles = withSourceContent(
+                session.sourceFilesByIds(new ArrayList<>(fileIds)),
+                scannedFiles
+        );
+        Map<String, String> scopeQnames = session.qnamesBySymbolIds(scopeIdList);
+        return new ConeSnapshot(
+                List.copyOf(valueNodes),
+                List.copyOf(dataEdges),
+                List.copyOf(edgeEvidence),
+                List.copyOf(callEdges),
+                List.copyOf(methodSummaries),
+                List.copyOf(pendingRefs),
+                Map.copyOf(sourceFiles),
+                Map.copyOf(scopeQnames)
+        );
+    }
+
+    // 作用：输出阶段耗时；逻辑：仅在设置 FTG_TRACE_PROFILE 时打印，避免影响正常输出。
+    private long profile(String phase, long startNanos) {
+        long now = System.nanoTime();
+        if (System.getenv("FTG_TRACE_PROFILE") != null) {
+            System.err.printf("[profile] %-22s %6.0fms%n", phase, (now - startNanos) / 1_000_000d);
+        }
+        return now;
+    }
+
+    /**
+     * Freshness verification needs the current file hashes. Re-reading and
+     * re-hashing every source file for each case dominated batch runs on large
+     * repositories. A read-only audit cannot outrun its own index, so a short
+     * process-local cache turns that per-case cost into a one-off while still
+     * refreshing periodically for long runs.
+     */
+    // 作用：读取源码快照；逻辑：同根目录同选项在 TTL 内复用，避免每条用例重复全仓读取与哈希。
+    private List<SourceFileRecord> captureSources(Path root, SourceScanOptions options) {
+        long now = System.currentTimeMillis();
+        Path normalized = root.toAbsolutePath().normalize();
+        synchronized (this) {
+            if (capturedFiles != null
+                    && normalized.equals(capturedRoot)
+                    && options.equals(capturedOptions)
+                    && now - capturedAtMillis <= SOURCE_SCAN_TTL_MILLIS) {
+                return capturedFiles;
+            }
+            List<SourceFileRecord> files = sourceReader.capture(root, options);
+            capturedRoot = normalized;
+            capturedOptions = options;
+            capturedFiles = files;
+            capturedAtMillis = now;
+            return files;
+        }
+    }
+
+    // 作用：在加载阶段检查预算；逻辑：超时抛出专用异常，避免大仓库在物化证据时长时间无响应。
+    private void ensureWithinDeadline(
+            io.fieldtracegraph.core.query.TraversalBudget budget,
+            long deadline,
+            String phase
+    ) {
+        if (budget.expired(deadline)) {
+            throw new io.fieldtracegraph.core.query.TraceTimeoutException(phase);
         }
     }
 
@@ -314,7 +537,16 @@ public class LineageQueryService {
     ) {
         List<TraceWeakHop> result = new ArrayList<>();
         for (PendingRefRecord ref : pendingRefs) {
-            if (!ref.externalBoundary()) {
+            if ("FIELD_ACCESSOR".equals(ref.referenceKind())) {
+                /*
+                 * An unverified external accessor is not a cross-call hop.
+                 * Its field node reports the CLASSPATH_MISSING boundary where
+                 * it matters, but counting every accessor in the call cone as
+                 * a weak hop would downgrade otherwise complete traces.
+                 */
+                continue;
+            }
+            if (!ref.externalBoundary() || isExpandedFrameworkAdapter(ref)) {
                 continue;
             }
             BoundaryAction action = BoundaryAction.forPendingReason(ref.reason());
@@ -342,6 +574,65 @@ public class LineageQueryService {
             ));
         }
         return List.copyOf(result);
+    }
+
+    /**
+     * Collection and tuple factories are expanded into field/element edges by
+     * the Java extractor. They have no callee body, but they are no longer
+     * unbridged value-flow boundaries, so counting them as weak hops would
+     * make an exact trace look partial.
+     */
+    // 作用：识别已由提取器展开的框架工厂；逻辑：按工厂类型与方法名匹配集合、元组和 Map.entry。
+    private boolean isExpandedFrameworkAdapter(PendingRefRecord ref) {
+        String name = ref.referenceName();
+        if (name == null) {
+            return false;
+        }
+        if (name.contains(".stream()") || name.contains(".parallelStream()")) {
+            /*
+             * Stream pipelines are expanded by StreamFlowExtractor. The
+             * terminal call has no callee body of its own, so it must not be
+             * counted as a missing external bridge.
+             */
+            return true;
+        }
+        int separator = name.indexOf('#');
+        if (separator <= 0) {
+            return false;
+        }
+        String owner = name.substring(0, separator);
+        int dot = owner.lastIndexOf('.');
+        if (dot >= 0) {
+            owner = owner.substring(dot + 1);
+        }
+        int arguments = name.indexOf('(', separator);
+        String method = arguments < 0
+                ? name.substring(separator + 1)
+                : name.substring(separator + 1, arguments);
+        if ("<init>".equals(method)) {
+            return EXPANDED_CONSTRUCTOR_TYPES.contains(owner);
+        }
+        if (EXPANDED_WRAPPER_TYPES.contains(owner)
+                && EXPANDED_WRAPPER_METHODS.contains(method)) {
+            return true;
+        }
+        if (EXPANDED_UTILITY_TYPES.contains(owner)) {
+            return true;
+        }
+        String normalizedOwner = owner.toLowerCase(java.util.Locale.ROOT);
+        if ("copy".equals(method)
+                && (normalizedOwner.contains("copier")
+                || normalizedOwner.contains("beancopy"))) {
+            /*
+             * cglib BeanCopier is reached through a local variable named
+             * {@code copier}; BeanCopyExtractor already emitted COPY_ALL and
+             * concrete property edges for that call, so it is not an
+             * unbridged value-flow boundary.
+             */
+            return true;
+        }
+        return EXPANDED_FACTORY_TYPES.contains(owner)
+                && EXPANDED_FACTORY_METHODS.contains(method);
     }
 
     // 作用：由文件 ID 取路径；逻辑：查不到记录时返回 null。

@@ -90,14 +90,22 @@ public final class ValueGraphDao {
             return List.of();
         }
         String placeholders = String.join(",", java.util.Collections.nCopies(scopeIds.size(), "?"));
+        /*
+         * value_data_edge.scope_symbol_id is written by the indexer from the
+         * source node's scope, so filtering the edge table directly returns
+         * exactly the rows the former value_node join produced. The join made
+         * the planner drive from value_node and probe idx_data_src_value once
+         * per node; on a wide call cone that dominated query IO. Selecting
+         * through idx_data_logical_key keeps the scan inside one covering
+         * range per scope.
+         */
         String query = """
                 SELECT edge.edge_id, edge.scope_symbol_id, edge.src_value_id, edge.dst_value_id, edge.edge_type,
                        edge.operation, edge.resolution, edge.evidence_id, edge.branch_id, edge.branch_condition,
                        edge.file_id, edge.line_start, edge.column_start, edge.line_end, edge.column_end, edge.statement_ordinal
                 """ + (provenanceColumnAvailable() ? ", edge.provenance " : " ") + """
                 FROM value_data_edge edge
-                JOIN value_node source_node ON source_node.value_id = edge.src_value_id
-                WHERE source_node.scope_symbol_id IN (""" + placeholders + ")\nORDER BY source_node.scope_symbol_id, edge.edge_id";
+                WHERE edge.scope_symbol_id IN (""" + placeholders + ")\nORDER BY edge.scope_symbol_id, edge.edge_id";
         try (PreparedStatement statement = connection.prepareStatement(query)) {
             for (int i = 0; i < scopeIds.size(); i++) {
                 statement.setString(i + 1, scopeIds.get(i));
@@ -194,7 +202,7 @@ public final class ValueGraphDao {
     // 作用：批量写入数据边；逻辑：绑定边类型、解析级别、分支与位置后批量插入。
     public void insertDataEdges(List<DataEdgeRecord> edges) {
         String sql = """
-                INSERT INTO value_data_edge(edge_id, scope_symbol_id, src_value_id, dst_value_id, edge_type, operation,
+                INSERT OR IGNORE INTO value_data_edge(edge_id, scope_symbol_id, src_value_id, dst_value_id, edge_type, operation,
                                           resolution, provenance, evidence_id, branch_id, branch_condition, file_id,
                                           line_start, column_start, line_end, column_end, statement_ordinal)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

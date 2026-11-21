@@ -65,22 +65,66 @@ final class ValueEdgeEmitter {
         if (targetKey == null || targetKey.isBlank()) {
             return statementOrdinal;
         }
+        ValueNodeRecord target = nodeCatalog.ensure(
+                source, scope, nodes, accumulator, targetKey, nodeKind(targetKey), anchor
+        );
+        return emitInto(
+                source, scope, nodes, accumulator, context, sourceExpression,
+                target, fieldTarget, anchor, statementOrdinal, operation, provenance
+        );
+    }
+
+    // 作用：把表达式发射到已存在的目标节点；逻辑：用于每-return 独立节点等调用方自建目标。
+    int emitToTarget(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            Expression sourceExpression,
+            ValueNodeRecord target,
+            Node anchor,
+            int statementOrdinal,
+            String operation,
+            Provenance provenance
+    ) {
+        if (target == null) {
+            return statementOrdinal;
+        }
+        return emitInto(
+                source, scope, nodes, accumulator, context, sourceExpression,
+                target, false, anchor, statementOrdinal, operation, provenance
+        );
+    }
+
+    // 作用：执行发射；逻辑：三元/switch 拆分支汇入目标，其余按来源逐条连边。
+    private int emitInto(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            Expression sourceExpression,
+            ValueNodeRecord target,
+            boolean fieldTarget,
+            Node anchor,
+            int statementOrdinal,
+            String operation,
+            Provenance provenance
+    ) {
         Expression expression = unwrap(sourceExpression);
         if (expression instanceof ConditionalExpr conditional) {
             return emitConditional(
                     source, scope, nodes, accumulator, context, conditional,
-                    targetKey, fieldTarget, anchor, statementOrdinal, operation, provenance
+                    target, fieldTarget, anchor, statementOrdinal, operation, provenance
             );
         }
         if (expression instanceof SwitchExpr switchExpression) {
             return emitSwitch(
                     source, scope, nodes, accumulator, context, switchExpression,
-                    targetKey, fieldTarget, anchor, statementOrdinal, operation, provenance
+                    target, fieldTarget, anchor, statementOrdinal, operation, provenance
             );
         }
-        ValueNodeRecord target = nodeCatalog.ensure(
-                source, scope, nodes, accumulator, targetKey, nodeKind(targetKey), anchor
-        );
         int ordinal = statementOrdinal;
         for (ExpressionFlowSources.Source input : ExpressionFlowSources.collect(expression, context)) {
             if ("BUILDER_RESULT".equals(input.edgeType())) {
@@ -113,7 +157,7 @@ final class ValueEdgeEmitter {
             JavaAnalysisAccumulator accumulator,
             JavaValueFlowContext context,
             ConditionalExpr conditional,
-            String targetKey,
+            ValueNodeRecord target,
             boolean fieldTarget,
             Node anchor,
             int statementOrdinal,
@@ -121,7 +165,7 @@ final class ValueEdgeEmitter {
             Provenance provenance
     ) {
         int ordinal = statementOrdinal;
-        String phiKey = "phi:" + targetKey + "@conditional:" + sourceKey(anchor)
+        String phiKey = "phi:" + target.canonicalValue() + "@conditional:" + sourceKey(anchor)
                 + ":" + ordinal;
         ValueNodeRecord phi = nodeCatalog.ensure(
                 source, scope, nodes, accumulator, phiKey, "PHI", conditional
@@ -134,9 +178,6 @@ final class ValueEdgeEmitter {
         ordinal = emitConditionalBranch(
                 source, scope, nodes, accumulator, context,
                 conditional.getElseExpr(), phi, negate(condition), fieldTarget, anchor, ordinal, provenance
-        );
-        ValueNodeRecord target = nodeCatalog.ensure(
-                source, scope, nodes, accumulator, targetKey, nodeKind(targetKey), anchor
         );
         addEdge(
                 source, scope, accumulator, phi, target,
@@ -206,7 +247,7 @@ final class ValueEdgeEmitter {
             JavaAnalysisAccumulator accumulator,
             JavaValueFlowContext context,
             SwitchExpr switchExpression,
-            String targetKey,
+            ValueNodeRecord target,
             boolean fieldTarget,
             Node anchor,
             int statementOrdinal,
@@ -215,7 +256,7 @@ final class ValueEdgeEmitter {
     ) {
         int ordinal = statementOrdinal;
         String selector = conditionText(switchExpression.getSelector());
-        String phiKey = "phi:" + targetKey + "@switch:" + sourceKey(anchor)
+        String phiKey = "phi:" + target.canonicalValue() + "@switch:" + sourceKey(anchor)
                 + ":" + ordinal;
         ValueNodeRecord phi = nodeCatalog.ensure(
                 source, scope, nodes, accumulator, phiKey, "PHI", switchExpression
@@ -255,9 +296,6 @@ final class ValueEdgeEmitter {
                 }
             }
         }
-        ValueNodeRecord target = nodeCatalog.ensure(
-                source, scope, nodes, accumulator, targetKey, nodeKind(targetKey), anchor
-        );
         addEdge(
                 source, scope, accumulator, phi, target,
                 fieldTarget ? "FIELD_WRITE" : "ASSIGNED_FROM",
@@ -339,6 +377,36 @@ final class ValueEdgeEmitter {
             Node anchor
     ) {
         return nodeCatalog.ensure(source, scope, nodes, accumulator, key, nodeKind(key), anchor);
+    }
+
+    // 作用：按显式根名创建字段节点；逻辑：供每-return builder 投影复用同一显示根、不同键。
+    ValueNodeRecord ensureField(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            String key,
+            String rootName,
+            String accessPath,
+            Node anchor
+    ) {
+        return nodeCatalog.ensureField(
+                source, scope, nodes, accumulator, key, rootName, accessPath, "FIELD", anchor
+        );
+    }
+
+    // 作用：确保每-return 版本节点存在；逻辑：键按 return 语句区分，显示值保持 RETURN。
+    ValueNodeRecord ensureReturn(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            Node returnStatement
+    ) {
+        return nodeCatalog.ensureReturn(
+                source, scope, nodes, accumulator,
+                ValueNodeCatalog.returnKey(returnStatement), returnStatement
+        );
     }
 
     // 作用：去除表达式包装；逻辑：循环剥离括号与强制类型转换。

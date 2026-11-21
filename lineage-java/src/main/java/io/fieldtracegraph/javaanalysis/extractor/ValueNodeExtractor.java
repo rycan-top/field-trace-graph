@@ -50,9 +50,25 @@ public final class ValueNodeExtractor {
             if (!CallableOwnership.belongsToCallableOrAnonymousBody(lambda, scope.callable())) {
                 continue;
             }
-            for (Parameter parameter : lambda.getParameters()) {
-                define(source, scope, latest, versions, parameter.getNameAsString(),
-                        "LAMBDA_PARAMETER", parameter, accumulator, context);
+            for (int index = 0; index < lambda.getParameters().size(); index++) {
+                Parameter parameter = lambda.getParameter(index);
+                String name = parameter.getNameAsString();
+                if (name.isBlank()) {
+                    continue;
+                }
+                /*
+                 * The scoped key keeps two lambdas that both name their
+                 * parameter {@code k} on separate nodes. The plain name is
+                 * still registered as a lookup alias for consumers that only
+                 * hold an identifier.
+                 */
+                define(source, scope, latest, versions,
+                        context.lambdaParameterKey(lambda, index),
+                        "LAMBDA_PARAMETER", name, parameter, accumulator, context);
+                ValueNodeRecord scoped = latest.get(context.lambdaParameterKey(lambda, index));
+                if (scoped != null) {
+                    latest.put(name, scoped);
+                }
             }
         }
         for (VariableDeclarator variable : scope.callable().findAll(VariableDeclarator.class)) {

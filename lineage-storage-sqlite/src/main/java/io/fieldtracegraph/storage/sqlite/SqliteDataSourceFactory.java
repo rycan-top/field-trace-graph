@@ -41,6 +41,18 @@ public class SqliteDataSourceFactory {
                             throw new SQLException("SQLite WAL mode is not available on the project filesystem");
                         }
                     }
+                    /*
+                     * The index is a rebuildable artifact, so NORMAL synchronous
+                     * durability is enough: it survives process crashes and only
+                     * risks the last transaction on an OS-level crash. A 64 MiB
+                     * page cache matters for large repositories, where the default
+                     * 2 MiB cache forces constant page churn during the bulk
+                     * insert of hundreds of thousands of nodes and edges.
+                     */
+                    statement.execute("PRAGMA synchronous = NORMAL");
+                    statement.execute("PRAGMA cache_size = -65536");
+                    statement.execute("PRAGMA temp_store = MEMORY");
+                    statement.execute("PRAGMA wal_autocheckpoint = 2000");
                 }
             }
             return connection;

@@ -26,6 +26,7 @@ public record LineageGraph(
         List<PendingRefRecord> pendingRefs,
         List<MethodSummaryRecord> methodSummaries,
         Map<String, SourceFileRecord> sourceFiles,
-        Map<String, String> scopeQnames
+        Map<String, String> scopeQnames,
+        boolean includeDependencies
 ) {
 }

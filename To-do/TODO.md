@@ -43,3 +43,4 @@
 - [x] 完整性结论独立于边质量：相关弱跳、未桥接消费方、候选边与截断都会使 `completeness` 变为 `PARTIAL`；`quality` 仍只统计已发射的字段值边。
 - [x] text 输出展示全部 chains，弱跳不再截断到前 10 条；其余折叠项会显式打印剩余数量。
 - [x] `CONDITION_USES` 仍作为依赖证据保留，只在 `--include-dependencies` 时输出。
+- [ACCURACY-REPORT.md](./ACCURACY-REPORT.md) — 通用字段流基准的可达性评测报告。

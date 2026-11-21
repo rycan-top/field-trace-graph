@@ -8,7 +8,9 @@ import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.type.PrimitiveType;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 // 作用：解析访问器方法对应的字段。
 // 使用场景：把 getX() 与 setX(v) 识别为字段 x 的读写。
@@ -55,17 +57,49 @@ public final class AccessorResolver {
             }
         }
 
+        Set<String> declaredFields = declaredFieldNames(type);
         for (MethodDeclaration method : type.getMethods()) {
             String name = method.getNameAsString();
             if (name.length() > 3 && name.startsWith("get") && method.getParameters().isEmpty() && !isVoid(method)) {
-                result.add(new Accessor(name, decapitalize(name.substring(3)), "READ"));
+                addIfDeclared(result, declaredFields, name, decapitalize(name.substring(3)), "READ");
             } else if (name.length() > 2 && name.startsWith("is") && method.getParameters().isEmpty() && isBoolean(method)) {
-                result.add(new Accessor(name, decapitalize(name.substring(2)), "READ"));
+                addIfDeclared(result, declaredFields, name, decapitalize(name.substring(2)), "READ");
             } else if (name.length() > 3 && name.startsWith("set") && method.getParameters().size() == 1) {
-                result.add(new Accessor(name, decapitalize(name.substring(3)), "WRITE"));
+                addIfDeclared(result, declaredFields, name, decapitalize(name.substring(3)), "WRITE");
             }
         }
         return List.copyOf(result);
+    }
+
+    // 作用：登记显式访问器；逻辑：仅当类型确实声明了该字段才登记，避免 setColorParam 这类
+    // 名称像 setter、实际没有对应字段的方法生成幽灵 this.colorParam 节点。
+    private void addIfDeclared(
+            List<Accessor> result,
+            Set<String> declaredFields,
+            String methodName,
+            String fieldName,
+            String kind
+    ) {
+        if (declaresField(declaredFields, fieldName)) {
+            result.add(new Accessor(methodName, fieldName, kind));
+        }
+    }
+
+    // 作用：判断字段是否已声明；逻辑：兼容布尔字段 isX 与属性名 x 的两种写法。
+    private boolean declaresField(Set<String> declaredFields, String fieldName) {
+        return declaredFields.contains(fieldName)
+                || declaredFields.contains("is" + capitalize(fieldName));
+    }
+
+    // 作用：收集类型直接声明的字段名；逻辑：遍历字段声明展开全部变量声明符。
+    private Set<String> declaredFieldNames(TypeDeclaration<?> type) {
+        Set<String> names = new HashSet<>();
+        for (FieldDeclaration field : type.getFields()) {
+            for (VariableDeclarator variable : field.getVariables()) {
+                names.add(variable.getNameAsString());
+            }
+        }
+        return names;
     }
 
     // 作用：判断节点是否带指定注解；逻辑：比较注解简单名或点号后缀，兼容全限定写法。

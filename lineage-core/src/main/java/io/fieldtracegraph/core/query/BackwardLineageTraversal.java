@@ -40,9 +40,11 @@ public final class BackwardLineageTraversal {
             }
             state.visited.add(previous);
             state.backwardVisited.add(previous);
-            if (frontier.visited.add(previous)) {
+            if (frontier.offer(previous)) {
                 frontier.depth.put(previous, currentDepth + 1);
                 discovered.add(previous);
+            } else if (frontier.capReason() != null) {
+                state.markTruncated(frontier.capReason());
             }
         }
         return discovered;

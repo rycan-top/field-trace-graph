@@ -33,7 +33,7 @@ public class TraceCommand implements Runnable {
     @Option(names = "--project", description = "Project root; defaults to the current directory")
     private String project;
 
-    @Option(names = "--method", required = true, description = "Method signature from methods; a stable method id is also accepted")
+    @Option(names = "--method", required = true, description = "Method signature from methods; a stable method id or 'module::signature' is also accepted")
     private String methodSelector;
 
     @Option(names = "--target", required = true, description = "Target expression, such as result.status")

@@ -45,7 +45,58 @@ public record TraceCompleteness(
                 result.failOnCandidate()
         );
         List<Reason> reasons = new ArrayList<>();
+        if (quality.status() == TraceQuality.Status.DEPENDENCY_ONLY
+                && quality.weakHopCount() == 0
+                && !result.truncated()) {
+            return new TraceCompleteness(
+                    Status.COMPLETE,
+                    List.of(new Reason(
+                            "CONDITION_ONLY",
+                            "the target is consumed only through condition/control dependencies"
+                    ))
+            );
+        }
+        /*
+         * Condition-only consumption stays condition-only when some unrelated
+         * consumer in the same cone cannot be bridged. Without this guard the
+         * empty edge list falls through to UNKNOWN, which reads as "we could
+         * not find anything" even though the control dependency is exact.
+         */
+        if (result.edges().isEmpty() && consumesOnlyConditions(result)) {
+            reasons.add(new Reason(
+                    "CONDITION_ONLY",
+                    "the target is consumed only through condition/control dependencies"
+            ));
+            if (result.truncated()) {
+                reasons.add(new Reason(
+                        "TRUNCATED",
+                        "traversal stopped early: " + String.join(",", result.truncationReasons())
+                ));
+            }
+            if (quality.weakHopCount() > 0) {
+                reasons.add(new Reason(
+                        "WEAK_HOPS",
+                        quality.weakHopCount()
+                                + " cross-call hops remain unbridged (including external/platform boundaries)"
+                ));
+            }
+            boolean partial = quality.weakHopCount() > 0 || result.truncated();
+            return new TraceCompleteness(partial ? Status.PARTIAL : Status.COMPLETE, List.copyOf(reasons));
+        }
         if (quality.unknown() || result.edges().isEmpty()) {
+            if (result.edges().isEmpty() && externalAccessorBoundary(result)) {
+                /*
+                 * The accessor exists in the source, so the field is not
+                 * "missing evidence"; the dependency metadata needed to prove
+                 * and follow it is missing. PARTIAL is the honest verdict.
+                 */
+                reasons.add(new Reason(
+                        "EXTERNAL_ACCESSOR_UNVERIFIED",
+                        "the field is read through an accessor whose receiver type is outside "
+                                + "the analysed sources; provide --classpath-file to prove it"
+                ));
+                return new TraceCompleteness(Status.PARTIAL, List.copyOf(reasons));
+            }
             reasons.add(new Reason("NO_FIELD_EVIDENCE", "no field-value evidence was produced"));
             return new TraceCompleteness(Status.UNKNOWN, List.copyOf(reasons));
         }
@@ -79,7 +130,8 @@ public record TraceCompleteness(
         if (quality.weakHopCount() > 0) {
             reasons.add(new Reason(
                     "WEAK_HOPS",
-                    quality.weakHopCount() + " consumer call sites could not be bridged into analysed source"
+                    quality.weakHopCount()
+                            + " cross-call hops remain unbridged (including external/platform boundaries)"
             ));
         }
         int unbridged = unbridgedConsumers(result);
@@ -101,12 +153,47 @@ public record TraceCompleteness(
     }
 
     // 作用：统计未桥接消费者边界；逻辑：按原因代码计不同值节点，避免重复计数。
+    /*
+     * True when the only consumption evidence for the value is a control
+     * dependency. A value that is also passed into an unbridged callee keeps
+     * the weaker UNKNOWN/PARTIAL treatment instead of being labelled as
+     * condition-only, because that consumer could carry the value onward.
+     */
+    // 作用：判断目标是否只被条件语句消费；逻辑：必须存在 CONDITION_USES 且没有未桥接消费者。
+    private static boolean consumesOnlyConditions(TraceResult result) {
+        if (result.boundaries() == null) {
+            return false;
+        }
+        boolean condition = false;
+        for (TraceBoundary boundary : result.boundaries()) {
+            String code = boundary.reasonCode();
+            if ("USE_UNRESOLVED".equals(code) || "USE_NOT_BRIDGED".equals(code)
+                    || "CONSUMED_BY_CALL".equals(code)) {
+                return false;
+            }
+            condition |= "CONDITION_USES".equals(boundary.reason());
+        }
+        return condition;
+    }
+
+    // 作用：判断是否存在外部访问器边界；逻辑：只认字段节点上的缺 classpath 或外部库原因。
+    private static boolean externalAccessorBoundary(TraceResult result) {
+        if (result.boundaries() == null) {
+            return false;
+        }
+        return result.boundaries().stream().anyMatch(boundary ->
+                "FIELD".equals(boundary.kind())
+                        && ("CLASSPATH_MISSING".equals(boundary.reasonCode())
+                        || "EXTERNAL_LIBRARY".equals(boundary.reasonCode())));
+    }
+
     private static int unbridgedConsumers(TraceResult result) {
         Map<String, Boolean> nodes = new LinkedHashMap<>();
         for (TraceBoundary boundary : result.boundaries()) {
             String code = boundary.reasonCode();
             boolean unbridged = "USE_UNRESOLVED".equals(code)
                     || "USE_NOT_BRIDGED".equals(code)
+                    || "CONSUMED_BY_CALL".equals(code)
                     || (code == null && "USE_UNRESOLVED".equals(boundary.reason()));
             if (unbridged) {
                 nodes.putIfAbsent(boundary.nodeId(), Boolean.TRUE);

@@ -59,6 +59,7 @@ public class IndexStatusService {
             boolean includeQuality
     ) {
         Path root = projectRootResolver.resolve(explicitProject);
+        options = ClasspathDiscovery.discover(root, options);
         Path databasePath = ProjectIndexPaths.databasePath(root);
         if (!Files.exists(databasePath)) {
             IndexStatusResult empty = new IndexStatusResult(0, "EMPTY", "UNKNOWN",

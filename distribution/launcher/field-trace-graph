@@ -16,4 +16,9 @@ if [ ! -x "$JAVA" ]; then
     JAVA=java
 fi
 
-exec "$JAVA" -jar "$JAR" "$@"
+# String deduplication removes the repeated ids/paths that dominate large
+# graphs; G1 is required for it and is the default collector on modern JDKs.
+# FTG_JAVA_OPTS lets operators add -Xmx or diagnostic flags without editing
+# this script.
+JAVA_OPTS=${FTG_JAVA_OPTS:-}
+exec "$JAVA" -XX:+UseG1GC -XX:+UseStringDeduplication $JAVA_OPTS -jar "$JAR" "$@"

@@ -72,10 +72,19 @@ public final class BuilderFlowExtractor {
         String propertyName = AccessorFieldIdentity.canonicalPropertyName(
                 property.getNameAsString()
         );
-        String targetKey = sink.root() + "." + propertyName;
-        ValueNodeRecord target = edgeEmitter.ensure(
-                source, scope, nodes, accumulator, targetKey, property
-        );
+        ValueNodeRecord target;
+        if (sink.returnSink() && sink.keyRoot() != null) {
+            target = edgeEmitter.ensureField(
+                    source, scope, nodes, accumulator,
+                    sink.keyRoot() + "." + propertyName,
+                    "RETURN", propertyName, property
+            );
+        } else {
+            String targetKey = sink.root() + "." + propertyName;
+            target = edgeEmitter.ensure(
+                    source, scope, nodes, accumulator, targetKey, property
+            );
+        }
         int result = ordinal;
         for (ExpressionFlowSources.Source input
                 : ExpressionFlowSources.collect(property.getArgument(0), context)) {
@@ -110,20 +119,22 @@ public final class BuilderFlowExtractor {
         }
         if (parent instanceof VariableDeclarator variable
                 && variable.getInitializer().filter(value -> unwrap(value) == build).isPresent()) {
-            return new FieldSink(variable.getNameAsString(), false);
+            return new FieldSink(variable.getNameAsString(), false, null);
         }
         if (parent instanceof AssignExpr assignment
                 && unwrap(assignment.getValue()) == build) {
-            return new FieldSink(context.key(assignment.getTarget()), false);
+            return new FieldSink(context.key(assignment.getTarget()), false, null);
         }
         if (parent instanceof ReturnStmt) {
-            return new FieldSink("RETURN", true);
+            return new FieldSink(
+                    "RETURN", true, ValueNodeCatalog.returnKey((ReturnStmt) parent)
+            );
         }
         if (parent instanceof MethodCallExpr setter
                 && context.isSetter(setter)
                 && unwrap(setter.getArgument(0)) == build) {
             String path = context.writeFieldPath(setter);
-            return new FieldSink(path, false);
+            return new FieldSink(path, false, null);
         }
         return null;
     }
@@ -142,6 +153,6 @@ public final class BuilderFlowExtractor {
         }
     }
 
-    private record FieldSink(String root, boolean returnSink) {
+    private record FieldSink(String root, boolean returnSink, String keyRoot) {
     }
 }

@@ -3,6 +3,7 @@ package io.fieldtracegraph.javaanalysis.extractor;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.stmt.ReturnStmt;
@@ -13,6 +14,7 @@ import io.fieldtracegraph.javaanalysis.JavaAnalysisAccumulator;
 import io.fieldtracegraph.javaanalysis.flow.CallableOwnership;
 import io.fieldtracegraph.javaanalysis.flow.GuardConditionResolver;
 import io.fieldtracegraph.javaanalysis.flow.JavaValueFlowContext;
+import io.fieldtracegraph.javaanalysis.resolution.AccessorFieldIdentity;
 import io.fieldtracegraph.javaanalysis.resolution.ExpressionTypeResolver;
 import io.fieldtracegraph.javaanalysis.resolution.SourceTypeCatalog;
 
@@ -67,7 +69,22 @@ public final class StreamFlowExtractor {
             for (MethodCallExpr stage : chain.stages()) {
                 for (Expression argument : stage.getArguments()) {
                     Expression value = unwrap(argument);
-                    if (value.isLambdaExpr() || value.isMethodReferenceExpr()) {
+                    if (value.isMethodReferenceExpr()) {
+                        continue;
+                    }
+                    /*
+                     * Collector factories wrap their callbacks one level
+                     * deeper: {@code collect(groupingBy(k -> ...))}. Emit
+                     * every lambda under the stage argument, not only a
+                     * direct lambda argument.
+                     */
+                    for (LambdaExpr lambda : value.findAll(LambdaExpr.class)) {
+                        ordinal = emitLambdaBody(
+                                source, scope, nodes, accumulator, context,
+                                lambda, targetKey, stage, ordinal
+                        );
+                    }
+                    if (value.isLambdaExpr()) {
                         continue;
                     }
                     if ("collect".equals(stage.getNameAsString()) && isIdentityCollector(value)) {
@@ -80,6 +97,36 @@ public final class StreamFlowExtractor {
                         call, stage, ordinal);
             }
         }
+    }
+
+    /**
+     * An expression-bodied lambda has no statement owner of its own, so the
+     * normal assignment/return extractors never see it. Its reads still feed
+     * the stage result: {@code collect(groupingBy(k -> k.getChannelId()))}
+     * groups by that field. Emitting the read against the chain result keeps
+     * the field traceable instead of leaving a node with no edges.
+     */
+    // 作用：提取流式 lambda 表达式体的读取流；逻辑：把体内字段读取连到该流阶段的结果值。
+    private int emitLambdaBody(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            LambdaExpr lambda,
+            String targetKey,
+            MethodCallExpr stage,
+            int ordinal
+    ) {
+        if (!lambda.getBody().isExpressionStmt()) {
+            return ordinal;
+        }
+        Expression body = lambda.getBody().asExpressionStmt().getExpression();
+        return edgeEmitter.emit(
+                source, scope, nodes, accumulator, context,
+                body, targetKey, false, lambda, ordinal,
+                "stream stage " + stage.getNameAsString() + " lambda"
+        );
     }
 
     /**
@@ -100,9 +147,21 @@ public final class StreamFlowExtractor {
             MethodCallExpr stage,
             int ordinal
     ) {
-        if (!Set.of("map", "flatMap").contains(stage.getNameAsString())
-                || stage.getArguments().size() != 1
-                || !(stage.getArgument(0) instanceof LambdaExpr lambda)) {
+        if (!Set.of(
+                "map", "flatMap",
+                "mapToInt", "mapToLong", "mapToDouble",
+                "flatMapToInt", "flatMapToLong", "flatMapToDouble"
+        ).contains(stage.getNameAsString())
+                || stage.getArguments().size() != 1) {
+            return ordinal;
+        }
+        if (stage.getArgument(0) instanceof MethodReferenceExpr reference) {
+            return emitMappedReferenceFields(
+                    source, scope, nodes, accumulator, context,
+                    chainCall, reference, ordinal
+            );
+        }
+        if (!(stage.getArgument(0) instanceof LambdaExpr lambda)) {
             return ordinal;
         }
         Expression result = lambdaResult(lambda).orElse(null);
@@ -122,6 +181,75 @@ public final class StreamFlowExtractor {
                     lambda, name.getNameAsString(), resultElement, ordinal
             );
         }
+        return ordinal;
+    }
+
+    /**
+     * {@code map(Bean::getId)} has no lambda body, so the normal field-read
+     * extractor never sees {@code getId()}. Project the accessor property from
+     * the stream element onto the chain result, mirroring an explicit
+     * {@code map(b -> b.getId())} body.
+     */
+    // 作用：展开方法引用的映射字段；逻辑：把源元素字段投影到流链结果的同名字段。
+    private int emitMappedReferenceFields(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            JavaValueFlowContext context,
+            MethodCallExpr chainCall,
+            MethodReferenceExpr reference,
+            int ordinal
+    ) {
+        if (!reference.getScope().isTypeExpr()) {
+            // A bound reference such as bean::getFoo already carries its own
+            // receiver; only Type::getter maps the stream element itself.
+            return ordinal;
+        }
+        String property = AccessorFieldIdentity.propertyFromAccessor(
+                reference.getIdentifier(), true
+        );
+        String sourceElement = context.streamElementKey(chainCall);
+        String resultRoot = null;
+        ValueNodeRecord chainNode = nodes.get(context.key(chainCall));
+        if (chainNode != null) {
+            resultRoot = chainNode.canonicalValue();
+        }
+        if (resultRoot == null || resultRoot.isBlank()) {
+            resultRoot = context.display(chainCall);
+            for (ValueNodeRecord node : nodes.values()) {
+                if (resultRoot.equals(node.canonicalValue())) {
+                    resultRoot = node.canonicalValue();
+                    break;
+                }
+            }
+        }
+        if (property == null
+                || sourceElement == null || sourceElement.isBlank()
+                || resultRoot == null || resultRoot.isBlank()) {
+            return ordinal;
+        }
+        ValueNodeRecord sourceNode = edgeEmitter.ensure(
+                source, scope, nodes, accumulator, sourceElement, reference
+        );
+        ValueNodeRecord origin = edgeEmitter.ensure(
+                source, scope, nodes, accumulator,
+                sourceElement + "." + property, reference
+        );
+        ValueNodeRecord target = edgeEmitter.ensureField(
+                source, scope, nodes, accumulator,
+                resultRoot + "." + property, resultRoot, property, reference
+        );
+        if (!sourceNode.valueId().equals(origin.valueId())) {
+            edgeEmitter.addEdge(
+                    source, scope, accumulator, sourceNode, origin,
+                    "CONTAINER_FLOW", "stream element field", reference, ordinal++
+            );
+        }
+        edgeEmitter.addEdge(
+                source, scope, accumulator, origin, target,
+                "FIELD_READ", "stream stage map method reference", reference, ordinal++
+        );
         return ordinal;
     }
 

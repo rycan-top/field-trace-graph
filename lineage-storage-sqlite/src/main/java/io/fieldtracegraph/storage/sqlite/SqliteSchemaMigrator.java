@@ -151,7 +151,8 @@ public final class SqliteSchemaMigrator {
         if (!definitionContains(connection, "parsed_invoke_edge", "VIRTUAL_UNIQUE")) {
             tables.add("parsed_invoke_edge");
         }
-        if (!definitionContains(connection, "pending_parse_invoke_ref", "dispatch_kind")) {
+        if (!definitionContains(connection, "pending_parse_invoke_ref", "dispatch_kind")
+                || !definitionContains(connection, "pending_parse_invoke_ref", "FIELD_ACCESSOR")) {
             tables.add("pending_parse_invoke_ref");
         }
         if (!definitionContains(connection, "method_summary", "parameter_mutations_json")) {

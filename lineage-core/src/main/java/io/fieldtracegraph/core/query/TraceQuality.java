@@ -47,6 +47,7 @@ public record TraceQuality(
         OK,
         PARTIAL,
         INSUFFICIENT,
+        DEPENDENCY_ONLY,
         UNKNOWN
     }
 
@@ -73,7 +74,12 @@ public record TraceQuality(
         boolean candidateBlocks = value.candidate() > 0
                 && (!allowCandidate || failOnCandidate);
         if (value.total() == 0) {
-            status = Status.UNKNOWN;
+            boolean conditionBoundary = result.boundaries() != null
+                    && result.boundaries().stream()
+                    .anyMatch(boundary -> "CONDITION_USES".equals(boundary.reason()));
+            status = dependency.total() > 0 || conditionBoundary
+                    ? Status.DEPENDENCY_ONLY
+                    : Status.UNKNOWN;
         } else if (ratio >= INSUFFICIENT_THRESHOLD) {
             status = Status.INSUFFICIENT;
         } else if (ratio >= PARTIAL_THRESHOLD

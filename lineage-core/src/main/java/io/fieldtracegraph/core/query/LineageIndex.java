@@ -31,6 +31,7 @@ import java.util.HashSet;
  * storage adapter.
  */
 final class LineageIndex {
+    private static final int MAX_CALL_CONTEXT_FRAMES = 64;
     private final LineageGraph graph;
     private final Map<String, ValueNodeRecord> nodesById = new LinkedHashMap<>();
     private final Map<String, SourceFileRecord> filesById = new HashMap<>();
@@ -51,19 +52,31 @@ final class LineageIndex {
     private final Map<String, List<ValueNodeRecord>> dataSourcesByDestination = new HashMap<>();
     private final Set<String> supportedFieldPaths = new HashSet<>();
     private final Set<String> fieldNodeKeys = new HashSet<>();
+    private final Set<String> fieldPathsWithDescendants = new HashSet<>();
+    private final Set<String> dependencyFieldPaths = new HashSet<>();
+    private final Set<String> fieldRootsWithEvidence = new HashSet<>();
     private final Map<String, List<ValueNodeRecord>> objectNodesByScopeAndName = new HashMap<>();
     private final Map<String, List<ValueNodeRecord>> fieldNodesByScopeAndPath = new HashMap<>();
     private final Set<String> containerElementKeys = new HashSet<>();
     private final Set<String> externalCallResultNodeIds = new HashSet<>();
     private final Map<String, String> externalReasonByResultValueId = new LinkedHashMap<>();
+    private final Set<String> dependencySourceNodeIds = new HashSet<>();
     private final Set<String> expansionRootIds;
+    private final boolean includeDependencies;
     private final int generation;
     private final String graphStatus;
 
     // 作用：构造内存血缘索引；逻辑：保存图、扩展根、代数与状态，后续由 build 填充各索引表。
-    private LineageIndex(LineageGraph graph, Set<String> expansionRootIds, int generation, String graphStatus) {
+    private LineageIndex(
+            LineageGraph graph,
+            Set<String> expansionRootIds,
+            boolean includeDependencies,
+            int generation,
+            String graphStatus
+    ) {
         this.graph = graph;
         this.expansionRootIds = expansionRootIds;
+        this.includeDependencies = includeDependencies;
         this.generation = generation;
         this.graphStatus = graphStatus;
     }
@@ -80,6 +93,7 @@ final class LineageIndex {
         LineageIndex index = new LineageIndex(
                 graph,
                 Set.copyOf(expansionRootIds),
+                graph.includeDependencies(),
                 graph.generation(),
                 graph.graphStatus()
         );
@@ -157,16 +171,57 @@ final class LineageIndex {
         for (DataEdgeRecord edge : graph.dataEdges()) {
             index.fieldNodeIdsWithEvidence.add(edge.srcValueId());
             index.fieldNodeIdsWithEvidence.add(edge.dstValueId());
+            if (edge.dependencyOnly()) {
+                index.registerDependencyField(edge.srcValueId());
+                index.dependencySourceNodeIds.add(edge.srcValueId());
+            }
             ValueNodeRecord sourceNode = index.nodesById.get(edge.srcValueId());
-            if (sourceNode != null && isEmpty(sourceNode.accessPath())) {
+            if (!edge.dependencyOnly()
+                    && sourceNode != null
+                    && isEmpty(sourceNode.accessPath())) {
                 index.dataSourcesByDestination
                         .computeIfAbsent(edge.dstValueId(), key -> new ArrayList<>())
                         .add(sourceNode);
             }
             logicalEdges.computeIfAbsent(edge.logicalEdgeKey(), key -> new ArrayList<>()).add(edge);
         }
+        for (ValueNodeRecord node : graph.valueNodes()) {
+            if (isEmpty(node.accessPath())
+                    || node.rootName() == null
+                    || !index.fieldNodeIdsWithEvidence.contains(node.valueId())) {
+                continue;
+            }
+            for (int depth = 1; depth < node.accessPath().size(); depth++) {
+                index.fieldPathsWithDescendants.add(index.fieldNodeKey(
+                        node.scopeSymbolId(),
+                        node.rootName(),
+                        node.accessPath().subList(0, depth)
+                ));
+            }
+            index.fieldRootsWithEvidence.add(index.fieldNodeKey(
+                    node.scopeSymbolId(), node.rootName(), List.of()));
+        }
+        /*
+         * Element writes point at the element object; the field itself is
+         * assigned by the edge that produced that node (`dto.setOwnerId(...)`).
+         * Keep the nearest preceding producer so `effect=` lands on the
+         * assignment rather than the object creation.
+         */
+        Map<String, List<DataEdgeRecord>> producerAnchor = new HashMap<>();
+        for (List<DataEdgeRecord> group : logicalEdges.values()) {
+            DataEdgeRecord candidate = preferredDataEdge(group);
+            ValueNodeRecord produced = index.nodesById.get(candidate.dstValueId());
+            if (produced == null || !"FIELD".equals(produced.valueKind())) {
+                continue;
+            }
+            producerAnchor.computeIfAbsent(candidate.dstValueId(), key -> new ArrayList<>())
+                    .add(candidate);
+        }
         for (Map.Entry<String, List<DataEdgeRecord>> entry : logicalEdges.entrySet()) {
             DataEdgeRecord edge = preferredDataEdge(entry.getValue());
+            if (!index.includeDependencies && edge.dependencyOnly()) {
+                continue;
+            }
             List<EdgeEvidence> evidence = mergedEvidence(
                     entry.getKey(),
                     entry.getValue(),
@@ -185,6 +240,16 @@ final class LineageIndex {
                     && isEmpty(sourceNode.accessPath())
                     && isEmpty(targetNode.accessPath())
                     && canPropagateFields(edge.edgeType(), sourceNode, targetNode);
+            /*
+             * A container write is anchored at the insertion call
+             * (`list.add(dto)`), while the element field is actually written
+             * where the element was built (`dto.setOwnerId(...)`). Surface that
+             * line as `effect=` so the evidence is auditable without walking
+             * back to the source node.
+             */
+            String effectLocation = elementEffectLocation(
+                    edge, sourceNode, graph,
+                    sourceNode == null ? null : producerAnchor.get(sourceNode.valueId()));
             index.addStep(edge.srcValueId(), edge.dstValueId(), new Step(
                     new ValueRef(edge.srcValueId(), List.of()),
                     new ValueRef(edge.dstValueId(), List.of()),
@@ -197,7 +262,11 @@ final class LineageIndex {
                     edge.columnStart(),
                     edge.lineEnd(),
                     edge.columnEnd(),
+                    effectLocation,
                     propagateFields,
+                    "",
+                    CallContextDirection.NONE,
+                    null,
                     provenance,
                     evidence
             ));
@@ -551,8 +620,12 @@ final class LineageIndex {
                     || (!isEmpty(source.accessPath()) && objectValuedFieldPaths.contains(
                     fieldNodeKey(source.scopeSymbolId(), source.rootName(), source.accessPath())));
         }
+
+        if (!fieldExpansionsByNode.getOrDefault(source.valueId(), List.of()).isEmpty()) {
+            return true;
+        }
         return switch (source.valueKind()) {
-            case "PARAMETER", "LOCAL", "EXPRESSION", "CALL_RESULT", "CONSTRUCTOR_RESULT", "FIELD" -> true;
+            case "CONSTRUCTOR_RESULT", "FIELD" -> true;
             default -> false;
         };
     }
@@ -736,6 +809,80 @@ final class LineageIndex {
     }
 
     // 作用：判断字段能否沿一条边传播；逻辑：比较边的字段选择、目标节点类型与路径约束。
+    /**
+     * Element writes are anchored at the container insertion, but the value
+     * itself is written where the element object is populated. Point the
+     * `effect=` column at that line when it differs from the anchor.
+     */
+    // 作用：计算元素写入的副作用位置；逻辑：仅对元素写边取源节点位置，与锚点相同则留空。
+    private static String elementEffectLocation(
+            DataEdgeRecord edge,
+            ValueNodeRecord sourceNode,
+            LineageGraph graph,
+            List<DataEdgeRecord> producers
+    ) {
+        if (sourceNode == null) {
+            return "";
+        }
+        if (!"WRITES_ELEMENT".equals(edge.edgeType())
+                && !"WRITE_ELEMENT_FIELD".equals(edge.edgeType())
+                && !"READS_ELEMENT".equals(edge.edgeType())) {
+            return "";
+        }
+        DataEdgeRecord best = null;
+        if (producers != null) {
+            for (DataEdgeRecord producer : producers) {
+                if (producer.lineStart() <= 0 || producer.lineStart() > edge.lineStart()) {
+                    continue;
+                }
+                /*
+                 * Only a real field write explains where the element field was
+                 * populated. A local's initializer or a constructor assignment
+                 * is not an effect of inserting that value into a container;
+                 * using it moves effect= to an unrelated declaration line.
+                 */
+                if (!"FIELD_WRITE".equals(producer.edgeType())
+                        && !"WRITE_ELEMENT_FIELD".equals(producer.edgeType())) {
+                    continue;
+                }
+                if (best == null || producer.lineStart() >= best.lineStart()) {
+                    best = producer;
+                }
+            }
+        }
+        if (best != null
+                && best.lineStart() != edge.lineStart()
+                && best.lineStart() != sourceNode.lineStart()) {
+            SourceFileRecord producerFile = graph.sourceFiles().get(best.fileId());
+            if (producerFile != null) {
+                return producerFile.relativePath() + ":" + best.lineStart() + ":" + best.columnStart();
+            }
+        }
+        if ("CONTAINER_ELEMENT".equals(sourceNode.valueKind())) {
+            // A container element such as list[*] is declared on the container
+            // itself (often a method parameter). Pointing effect= at that line
+            // repeats the declaration instead of a real write site.
+            return "";
+        }
+        if (!"FIELD".equals(sourceNode.valueKind())) {
+            // Locals, parameters and call results are declared at their
+            // introduction, not at the container insertion. Let the edge line
+            // remain the anchor instead of a misleading declaration line.
+            return "";
+        }
+        if (sourceNode.lineStart() <= 0
+                || (sourceNode.lineStart() == edge.lineStart()
+                && sourceNode.columnStart() == edge.columnStart())) {
+            return "";
+        }
+        SourceFileRecord file = graph.sourceFiles().get(sourceNode.fileId());
+        if (file == null) {
+            return "";
+        }
+        return file.relativePath() + ":" + sourceNode.lineStart() + ":" + sourceNode.columnStart();
+    }
+
+    // 作用：判断字段能否沿一条边传播；逻辑：比较边的字段选择、目标节点类型与路径约束。
     private static boolean canPropagateFields(
             String edgeType,
             ValueNodeRecord source,
@@ -758,8 +905,7 @@ final class LineageIndex {
         }
         // A call result is derived from its arguments only at value level. The
         // same-named field of an argument is not the source of the result
-        // field; that link is carried by the explicit RETURN_FROM bridge. Allowing
-        // it here invented paths such as {@code pin.addressId} for a String
+        // field; that link is carried by the explicit RETURN_FROM bridge.
         // parameter of a DAO lookup.
         if ("CALL_RESULT".equals(target.valueKind())) {
             return false;
@@ -772,8 +918,23 @@ final class LineageIndex {
     // 作用：取节点的入边步；逻辑：查入边索引，必要时补全具体字段入边。
     List<Step> incoming(ValueRef ref) {
         List<Step> result = new ArrayList<>();
-        collectIncoming(canonicalFieldRef(ref), result, new HashSet<>());
+        collectIncoming(canonicalFieldRef(ref), result, new HashSet<>(), Integer.MAX_VALUE);
+        pruneUnprovableFields(result, false);
         return result;
+    }
+
+    /**
+     * Boundary projection only needs to know whether any incoming step exists.
+     * Materialising the full incoming set for every visited ref is quadratic on
+     * wide objects: an object root expands every field, and each expansion
+     * recurses again. Stopping at the first valid step keeps the same answer
+     * for a fraction of the work.
+     */
+    // 作用：判断是否存在入边；逻辑：收集到第一条有效步即停止。
+    boolean hasIncoming(ValueRef ref) {
+        List<Step> probe = new ArrayList<>(1);
+        collectIncoming(canonicalFieldRef(ref), probe, new HashSet<>(), 1);
+        return !probe.isEmpty();
     }
 
     /**
@@ -800,7 +961,7 @@ final class LineageIndex {
             return ref;
         }
         List<String> path = new ArrayList<>(node.accessPath());
-        path.addAll(ref.fields());
+        appendFields(path, ref.fields());
         return new ValueRef(root.valueId(), List.copyOf(path), ref.callContext());
     }
 
@@ -832,8 +993,12 @@ final class LineageIndex {
     private void collectIncoming(
             ValueRef ref,
             List<Step> result,
-            Set<ValueRef> visiting
+            Set<ValueRef> visiting,
+            int limit
     ) {
+        if (result.size() >= limit) {
+            return;
+        }
         if (!visiting.add(ref)) {
             return;
         }
@@ -846,9 +1011,28 @@ final class LineageIndex {
                 if (!canPropagateSelectedField(step, ref.fields())) {
                     continue;
                 }
+                /*
+                 * A step can target a concrete field (`request.recordId`)
+                 * rather than an object. Appending the selected sibling field
+                 * to a scalar field invents paths such as
+                 * `request.recordId.sourceChannel`. Only compose when that
+                 * field actually owns descendants; object-valued fields have
+                 * them by construction, scalars never do.
+                 */
+                ValueNodeRecord targetNode = nodesById.get(step.target().nodeId());
+                if (targetNode != null
+                        && !isEmpty(targetNode.accessPath())
+                        && !targetNode.accessPath().equals(ref.fields())
+                        && !hasFieldDescendant(targetNode, List.of())) {
+                    continue;
+                }
                 result.add(step.withSource(withFields(previous, ref.fields())));
             } else if (canComposeFieldPath(step, ref)) {
-                result.add(step.withSource(composeFieldPath(previous, ref.fields())));
+                ValueRef composed = composeFieldPath(previous, ref.fields());
+                if (composed == null) {
+                    continue;
+                }
+                result.add(step.withSource(composed));
             } else if (step.target().fields().equals(ref.fields())) {
                 ValueNodeRecord previousNode = nodesById.get(previous.nodeId());
                 boolean pathAlreadyEncoded = previousNode != null
@@ -858,6 +1042,9 @@ final class LineageIndex {
                         ? previous
                         : withFields(previous, ref.fields())));
             }
+            if (result.size() >= limit) {
+                return;
+            }
         }
         if (!ref.fields().isEmpty()) {
             for (Step producer : callProducerStepsByResultNode.getOrDefault(ref.nodeId(), List.of())) {
@@ -866,6 +1053,9 @@ final class LineageIndex {
                         ref.fields(),
                         ref.callContext()
                 )));
+                if (result.size() >= limit) {
+                    return;
+                }
             }
         }
         // A virtual field path over an object root also needs the concrete
@@ -878,6 +1068,9 @@ final class LineageIndex {
             // setter arguments.
             for (FieldExpansion expansion : fieldExpansionsByNode.getOrDefault(ref.nodeId(), List.of())) {
                 result.add(expansion.emptyStep().reversed());
+                if (result.size() >= limit) {
+                    return;
+                }
                 collectIncoming(
                         new ValueRef(
                                 expansion.emptyStep().target().nodeId(),
@@ -885,8 +1078,12 @@ final class LineageIndex {
                                 ref.callContext()
                         ),
                         result,
-                        visiting
+                        visiting,
+                        limit
                 );
+                if (result.size() >= limit) {
+                    return;
+                }
             }
         } else {
             for (FieldExpansion expansion : fieldExpansionsByNode.getOrDefault(ref.nodeId(), List.of())) {
@@ -900,11 +1097,17 @@ final class LineageIndex {
                                 result,
                                 visiting
                         );
+                        if (result.size() >= limit) {
+                            return;
+                        }
                     }
                 } else if (ref.fields().size() > expansion.path().size()
                         && ref.fields().subList(0, expansion.path().size()).equals(expansion.path())
                         && isObjectValuedField(nodesById.get(expansion.pathStep().target().nodeId()))) {
                     collectObjectValuedFieldIncoming(expansion, ref, result, visiting);
+                    if (result.size() >= limit) {
+                        return;
+                    }
                 }
             }
         }
@@ -975,6 +1178,14 @@ final class LineageIndex {
                 continue;
             }
             ValueNodeRecord source = nodesById.get(previous.nodeId());
+            if (source != null && "CONSTANT".equals(source.valueKind())) {
+                /*
+                 * A literal carries no object fields. Projecting the remaining
+                 * suffix onto it would invent a field path such as
+                 * literal:NULL.calculateTaxPrice for a null Pair component.
+                 */
+                continue;
+            }
             if ("FIELD_WRITE".equals(step.edgeType())
                     && source != null
                     && isEmpty(source.accessPath())) {
@@ -984,7 +1195,11 @@ final class LineageIndex {
                 continue;
             }
             if (source != null && !isEmpty(source.accessPath())) {
-                result.add(step.withSource(composeFieldPath(previous, rest)));
+                ValueRef composed = composeFieldPath(previous, rest);
+                if (composed == null) {
+                    continue;
+                }
+                result.add(step.withSource(composed));
                 continue;
             }
             result.add(step.withSource(new ValueRef(
@@ -1009,7 +1224,9 @@ final class LineageIndex {
             }
             ValueRef projectedContainerField = projectContainerFieldWrite(step, current, next);
             if (projectedContainerField != null) {
-                result.add(step.withSource(current).withTarget(projectedContainerField));
+                result.add(step.withSource(current)
+                        .withTarget(projectedContainerField)
+                        .withEffectLocation(containerFieldEffectLocation(step, current)));
                 continue;
             }
             ValueNodeRecord nextNode = nodesById.get(next.nodeId());
@@ -1050,7 +1267,9 @@ final class LineageIndex {
             }
             ValueRef projected = projectNestedContainerWrite(step, current, next);
             if (projected != null) {
-                result.add(step.withSource(current).withTarget(projected));
+                result.add(step.withSource(current)
+                        .withTarget(projected)
+                        .withEffectLocation(containerFieldEffectLocation(step, current)));
             }
         }
         for (FieldExpansion expansion : fieldExpansionsByNode.getOrDefault(current.nodeId(), List.of())) {
@@ -1063,7 +1282,30 @@ final class LineageIndex {
                 addConcreteFieldOutgoing(current, expansion, result);
             }
         }
+        pruneUnprovableFields(result, true);
         return result;
+    }
+
+    /*
+     * Field selections are attached at several transition sites (concrete
+     * field steps, container projections, propagated steps, call bridges).
+     * Filtering at the exit of outgoing()/collectIncoming() keeps one rule
+     * instead of duplicating a guard in every branch: a step may only carry a
+     * virtual path that the carrier can prove in its own scope.
+     */
+    // 作用：丢弃无法证明的字段投影；逻辑：对每条步的源/目标引用检查载体是否暴露该路径。
+    private void pruneUnprovableFields(List<Step> steps, boolean outgoing) {
+        if (steps.isEmpty()) {
+            return;
+        }
+        steps.removeIf(step -> {
+            ValueRef ref = outgoing ? step.target() : step.source();
+            if (ref == null || ref.fields().isEmpty()) {
+                return false;
+            }
+            ValueNodeRecord node = nodesById.get(ref.nodeId());
+            return node != null && !exposesPath(node, ref.fields());
+        });
     }
 
     /**
@@ -1085,14 +1327,7 @@ final class LineageIndex {
                 0,
                 element.canonicalValue().length() - 3
         );
-        ValueNodeRecord root = nodesById.values().stream()
-                .filter(candidate -> candidate.scopeSymbolId().equals(element.scopeSymbolId()))
-                .filter(candidate -> rootValue.equals(candidate.canonicalValue()))
-                .filter(candidate -> isEmpty(candidate.accessPath()))
-                .filter(candidate -> candidate.declarationOffset() <= element.declarationOffset())
-                .max(Comparator.comparingInt(ValueNodeRecord::declarationOffset)
-                        .thenComparingInt(ValueNodeRecord::definitionOrdinal))
-                .orElse(null);
+        ValueNodeRecord root = containerRoot(element, rootValue);
         return root == null
                 ? List.of()
                 : outgoingByNode.getOrDefault(root.valueId(), List.of());
@@ -1162,15 +1397,37 @@ final class LineageIndex {
             return null;
         }
         String rootValue = canonical.substring(0, bracket);
-        ValueNodeRecord root = nodesById.values().stream()
-                .filter(candidate -> candidate.scopeSymbolId().equals(entry.scopeSymbolId()))
-                .filter(candidate -> rootValue.equals(candidate.canonicalValue()))
-                .filter(candidate -> isEmpty(candidate.accessPath()))
-                .filter(candidate -> candidate.declarationOffset() <= entry.declarationOffset())
-                .max(Comparator.comparingInt(ValueNodeRecord::declarationOffset)
-                        .thenComparingInt(ValueNodeRecord::definitionOrdinal))
-                .orElse(null);
+        ValueNodeRecord root = containerRoot(entry, rootValue);
         return root == null ? null : new NestedContainer(root, relativePath);
+    }
+
+    /**
+     * Resolve the owning container for an element projection. This used to scan
+     * every loaded value node, which turned boundary rendering into an
+     * O(edges x nodes) pass and hung multi-second traces on repositories with
+     * hundreds of thousands of nodes. The object index is already keyed by
+     * scope and canonical value, so only the (usually tiny) bucket of
+     * whole-object nodes needs to be examined.
+     */
+    // 作用：定位容器元素所属的整体对象节点；逻辑：走作用域+值索引，取声明位置不晚于元素的最近节点。
+    private ValueNodeRecord containerRoot(ValueNodeRecord element, String rootValue) {
+        List<ValueNodeRecord> candidates = objectNodesByScopeAndName.getOrDefault(
+                scopeAndValue(element.scopeSymbolId(), rootValue),
+                List.of()
+        );
+        ValueNodeRecord root = null;
+        for (ValueNodeRecord candidate : candidates) {
+            if (candidate.declarationOffset() > element.declarationOffset()) {
+                continue;
+            }
+            if (root == null
+                    || candidate.declarationOffset() > root.declarationOffset()
+                    || (candidate.declarationOffset() == root.declarationOffset()
+                            && candidate.definitionOrdinal() > root.definitionOrdinal())) {
+                root = candidate;
+            }
+        }
+        return root;
     }
 
     /**
@@ -1201,6 +1458,47 @@ final class LineageIndex {
         }
         fields.addAll(current.fields());
         return new ValueRef(next.nodeId(), List.copyOf(fields), next.callContext());
+    }
+
+    // 作用：计算容器字段投影的精确副作用位置；逻辑：按当前字段路径查找不晚于插入行的最近字段节点。
+    private String containerFieldEffectLocation(Step step, ValueRef current) {
+        if (current.fields().isEmpty()
+                || (!"WRITES_ELEMENT".equals(step.edgeType())
+                && !"COPIES_ELEMENTS".equals(step.edgeType()))) {
+            return step.effectLocation();
+        }
+        ValueNodeRecord source = nodesById.get(current.nodeId());
+        if (source == null) {
+            return step.effectLocation();
+        }
+        ValueNodeRecord root = isEmpty(source.accessPath()) ? source : fieldRoot(source);
+        if (root == null || root.canonicalValue() == null) {
+            return step.effectLocation();
+        }
+        List<ValueNodeRecord> candidates = fieldNodesByScopeAndPath.getOrDefault(
+                fieldNodeKey(root.scopeSymbolId(), root.canonicalValue(), current.fields()),
+                List.of()
+        );
+        ValueNodeRecord best = null;
+        for (ValueNodeRecord candidate : candidates) {
+            if (candidate.lineStart() <= 0
+                    || candidate.lineStart() > step.lineStart()) {
+                continue;
+            }
+            if (best == null
+                    || candidate.lineStart() > best.lineStart()
+                    || (candidate.lineStart() == best.lineStart()
+                    && candidate.columnStart() > best.columnStart())) {
+                best = candidate;
+            }
+        }
+        if (best == null || best.lineStart() == step.lineStart()) {
+            return step.effectLocation();
+        }
+        SourceFileRecord file = filesById.get(best.fileId());
+        return file == null
+                ? step.effectLocation()
+                : file.relativePath() + ":" + best.lineStart() + ":" + best.columnStart();
     }
 
     // 作用：判断节点是否为集合载体；逻辑：节点类型属于集合或映射时返回 true。
@@ -1260,11 +1558,22 @@ final class LineageIndex {
      */
     // 作用：判断返回节点是否支持字段路径；逻辑：检查返回值来源字段是否覆盖目标路径。
     private boolean supportsReturnFieldPath(String returnNodeId, List<String> fields) {
-        if (supportsFieldPath(returnNodeId, fields)) {
+        return supportsReturnFieldPath(returnNodeId, fields, new HashSet<>());
+    }
+
+    /**
+     * The recursive overload must share the caller's {@code visiting} set.
+     * Starting a fresh set here lets a recursive or mutually recursive callee
+     * re-enter {@code supportsFieldPath} forever and overflow the stack; the
+     * guard only works when every hop of the same decision shares one set.
+     */
+    // 作用：在共享访问集合下判断返回节点字段路径；逻辑：先查本节点再看其来源节点。
+    private boolean supportsReturnFieldPath(String returnNodeId, List<String> fields, Set<String> visiting) {
+        if (supportsFieldPath(returnNodeId, fields, visiting)) {
             return true;
         }
         for (ValueNodeRecord source : dataSourcesByDestination.getOrDefault(returnNodeId, List.of())) {
-            if (supportsFieldPath(source.valueId(), fields)) {
+            if (supportsFieldPath(source.valueId(), fields, visiting)) {
                 return true;
             }
         }
@@ -1352,6 +1661,7 @@ final class LineageIndex {
                     && targetNode != null
                     && "CALL_RESULT".equals(targetNode.valueKind())
                     && !selected.fields().isEmpty()
+                    && !isVoidCallResult(targetNode.valueId())
                     && supportsFieldPath(targetNode.valueId(), selected.fields());
             if (preserves) {
                 result.add(step.withSource(selected).withTarget(new ValueRef(
@@ -1359,7 +1669,26 @@ final class LineageIndex {
                         selected.fields(),
                         next.callContext()
                 )));
-            } else if ("FIELD_READ".equals(step.edgeType())
+                continue;
+            }
+            /*
+             * Framework adapters emit DERIVED_FROM from a concrete field to the
+             * serialized value (for example {@code JSON.toJSONString(bean)} or a
+             * cache payload). Those edges never pass {@code preserves}
+             * because their source is a field node, so without this branch a
+             * field that is only serialized looks unused even though the
+             * evidence exists. Keep the selected field on the derived value so
+             * the chain continues into the callee that consumes it.
+             */
+            if ("DERIVED_FROM".equals(step.edgeType())) {
+                result.add(step.withSource(selected).withTarget(new ValueRef(
+                        next.nodeId(),
+                        selected.fields(),
+                        next.callContext()
+                )));
+                continue;
+            }
+            if ("FIELD_READ".equals(step.edgeType())
                     && targetNode != null
                     && isEmpty(targetNode.accessPath())) {
                 /*
@@ -1398,13 +1727,6 @@ final class LineageIndex {
         return supportsFieldPath(nodeId, fields, new HashSet<>());
     }
 
-    /**
-     * A parameter can carry a field into another callee even when that method
-     * does not read the field directly. For example, autoPay forwards
-     * orderRequest through executeSubmitOrder before buildInvoice reads
-     * addressId. Checking only the first callee's local field expansions stops
-     * every such forward chain at the method boundary.
-     */
     // 作用：递归判断字段路径是否支持；逻辑：沿来源边回溯匹配路径，访问集合用于防止环。
     private boolean supportsFieldPath(String nodeId, List<String> fields, Set<String> visiting) {
         String key = nodeId + "\u0001" + String.join(".", fields);
@@ -1414,12 +1736,27 @@ final class LineageIndex {
         if (!visiting.add(key)) {
             return false;
         }
+        ValueNodeRecord node = nodesById.get(nodeId);
+        if (node != null
+                && node.rootName() != null
+                && node.accessPath() != null
+                && node.accessPath().equals(fields)
+                && fieldNodeKeys.contains(fieldNodeKey(
+                node.scopeSymbolId(), node.rootName(), fields))) {
+            /*
+             * PHI/branch versions are excluded from virtual field expansion,
+             * but they can still carry a concrete field node for the selected
+             * path. Without this check the field chain stops at the version
+             * carrier instead of continuing through its assignment edge.
+             */
+            supportedFieldPaths.add(key);
+            return true;
+        }
         if (fieldExpansionsByNode.getOrDefault(nodeId, List.of()).stream()
                 .anyMatch(expansion -> fields.equals(expansion.path()))) {
             supportedFieldPaths.add(key);
             return true;
         }
-        ValueNodeRecord node = nodesById.get(nodeId);
         if (node == null) {
             return false;
         }
@@ -1436,11 +1773,16 @@ final class LineageIndex {
          *
          *   merchantConfig = paymentService.fetchMerchantConfig(...)
          *
-         * back to the external call-result boundary without treating pin or
-         * orderId query keys as sources of the field.
+         * back to the external call-result boundary without treating user or
+         * order query keys as sources of the field.
          */
+        boolean logicalVersion = isLogicalVersionNode(node);
         for (Step step : incomingByNode.getOrDefault(nodeId, List.of())) {
-            if (!"ASSIGNED_FROM".equals(step.edgeType()) || !step.propagateFields()) {
+            if (!step.propagateFields()) {
+                continue;
+            }
+            if (!"ASSIGNED_FROM".equals(step.edgeType())
+                    && !(logicalVersion && "PHI_INPUT".equals(step.edgeType()))) {
                 continue;
             }
             ValueNodeRecord source = nodesById.get(step.source().nodeId());
@@ -1476,12 +1818,7 @@ final class LineageIndex {
         for (CallEdgeRecord call : callsByResultNode.getOrDefault(resultNodeId, List.of())) {
             resolvedCalleeObserved = true;
             for (ValueNodeRecord returnNode : returnsByScope.getOrDefault(call.calleeSymbolId(), List.of())) {
-                if (supportsReturnFieldPath(returnNode.valueId(), fields)) {
-                    return true;
-                }
-                String key = returnNode.valueId() + "\u0001" + String.join(".", fields);
-                if (visiting.add(key)
-                        && supportsFieldPath(returnNode.valueId(), fields, visiting)) {
+                if (supportsReturnFieldPath(returnNode.valueId(), fields, visiting)) {
                     return true;
                 }
             }
@@ -1491,8 +1828,15 @@ final class LineageIndex {
          * The selected field is still a real field because it was resolved
          * from a concrete read in the caller. Keep the result as an explicit
          * boundary rather than dropping the chain or inventing a local source.
+         *
+         * A container entry selection is different: {@code map["k"]} names a
+         * key, not a field of the returned value. {@code MapUtils.getString(map,
+         * "goUrl")} returns a String, so carrying the sibling entry selection
+         * would invent {@code floorResult["goUrl"]["couponSku"]}.
          */
-        return !resolvedCalleeObserved && externalCallResultNodeIds.contains(resultNodeId);
+        return !resolvedCalleeObserved
+                && externalCallResultNodeIds.contains(resultNodeId)
+                && (fields.isEmpty() || !fields.get(0).startsWith("["));
     }
 
     // 作用：按位置取形参节点；逻辑：从作用域参数列表读取，越界返回 null。
@@ -1540,7 +1884,33 @@ final class LineageIndex {
                 && !current.fields().isEmpty()
                 && !step.target().fields().equals(current.fields())
                 && "FIELD_READ".equals(step.edgeType())
-                && !isArgumentOrReturnCarrier(step.target().nodeId());
+                && !isArgumentOrReturnCarrier(step.target().nodeId())
+                && !composesSiblingField(step, source, current.fields());
+    }
+
+
+    // 作用：识别同一接收者上的兄弟字段拼接；逻辑：同根对象且路径无重叠时返回 true。
+    private boolean composesSiblingField(
+            Step step,
+            ValueNodeRecord source,
+            List<String> fields
+    ) {
+        ValueNodeRecord target = nodesById.get(step.target().nodeId());
+        if (target == null || !isEmpty(target.accessPath())) {
+            return false;
+        }
+        String targetRoot = target.rootName() == null || target.rootName().isBlank()
+                ? target.canonicalValue()
+                : target.rootName();
+        if (source.rootName() == null || !source.rootName().equals(targetRoot)) {
+            return false;
+        }
+        return !pathsOverlap(source.accessPath(), fields);
+    }
+
+    // 作用：判断两段字段路径是否互为前缀；逻辑：任一方向的前缀匹配即可。
+    private static boolean pathsOverlap(List<String> left, List<String> right) {
+        return endsWith(left, right) || endsWith(right, left);
     }
 
     // 作用：判断节点是否为实参或返回值载体；逻辑：节点类型属于参数或返回值时返回 true。
@@ -1554,15 +1924,147 @@ final class LineageIndex {
     private ValueRef composeFieldPath(ValueRef sourceRef, List<String> currentFields) {
         ValueNodeRecord source = nodesById.get(sourceRef.nodeId());
         if (source == null || isEmpty(source.accessPath())) {
+            if (alreadyEndsWith(source, currentFields)) {
+                return withFields(sourceRef, List.of());
+            }
+            if (!currentFields.isEmpty() && !exposesPath(source, currentFields)) {
+                /*
+                 * `shopId2ShopName` is a Map and `materialSkus` is a
+                 * List<String>; neither can expose the selected field. The
+                 * traversal used to carry the selection anyway, producing
+                 * `shopId2ShopName.msg` and `materialSkus[*].purchasePrice`.
+                 * Only keep a virtual path when this scope has a field node
+                 * for it, when the node is a container element, or when it is
+                 * a bridging node that legitimately forwards a callee path.
+                 */
+                return withFields(sourceRef, List.of());
+            }
             return withFields(sourceRef, currentFields);
+        }
+        /*
+         * Repeating the same selector must not grow the path without bound.
+         * `items[*].link` is already the selected `link` field; applying
+         * `link` again produced `link.link`, `link.link.link`, ... for every
+         * additional traversal step.
+         */
+        List<String> existing = source.accessPath();
+        if (endsWith(existing, currentFields)) {
+            return withFields(sourceRef, List.of());
         }
         ValueNodeRecord root = fieldRoot(source);
         if (root == null) {
             return withFields(sourceRef, currentFields);
         }
         List<String> path = new ArrayList<>(source.accessPath());
-        path.addAll(currentFields);
+        appendFields(path, currentFields);
+        if (!exposesPath(root, path)) {
+            /*
+             * The carrier is itself a concrete field (for example
+             * `query.concurrentParam`) and the index has no field node for
+             * `query.concurrentParam.miaoSongInfoMap`. Degrading to the
+             * carrier field would attribute a write/read of the nested field
+             * to its owner and produce a false edge on `query.concurrentParam`.
+             * Dropping the step is the conservative choice: the nested path is
+             * not proven in this scope.
+             */
+            return null;
+        }
         return new ValueRef(root.valueId(), List.copyOf(path), sourceRef.callContext());
+    }
+
+    /*
+     * A virtual field path is only meaningful when the carrier can expose it.
+     * Bridging nodes (RETURN / PHI / CALL_RESULT) forward a path that was
+     * proven in the callee's scope, and container elements forward it to their
+     * element type, so both stay permissive. Everything else must have a
+     * concrete field node for the exact path in the current scope; otherwise
+     * the selection is an over-projection and is dropped.
+     */
+    // 作用：判断载体是否能暴露该字段路径；逻辑：桥接节点放行，其余要求同作用域存在对应字段节点。
+    private boolean exposesPath(ValueNodeRecord carrier, List<String> fields) {
+        if (fields.isEmpty() || carrier == null) {
+            return true;
+        }
+        String kind = carrier.valueKind();
+        if ("RETURN".equals(kind) || "PHI".equals(kind) || "CALL_RESULT".equals(kind)) {
+            return true;
+        }
+        /*
+         * A container entry selection names a key, not a field of the element
+         * type, so it cannot be validated by field-node lookup.
+         */
+        if (fields.get(0).startsWith("[")) {
+            return true;
+        }
+        String canonical = carrier.canonicalValue();
+        if (canonical == null || canonical.isEmpty()) {
+            return true;
+        }
+        List<String> carrierPath = carrier.accessPath() == null ? List.of() : carrier.accessPath();
+        if (endsWith(carrierPath, fields)) {
+            return true;
+        }
+        String root = carrier.rootName() == null || carrier.rootName().isBlank()
+                ? canonical
+                : carrier.rootName();
+        /*
+         * The carrier's own access path must be part of the lookup. Checking
+         * only the selection let `collectionRes.tabList` inherit
+         * `collectionRes.msg`, because the scope does declare `msg` on the
+         * root object.
+         */
+        List<String> fullPath = joinFields(carrierPath, fields);
+        if (hasFieldNode(carrier.scopeSymbolId(), root, fullPath)) {
+            return true;
+        }
+        for (FieldExpansion expansion : fieldExpansionsByNode.getOrDefault(carrier.valueId(), List.of())) {
+            if (expansion.path().equals(fullPath)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Appends a field selection without repeating an already encoded suffix.
+     * Canonicalisation runs after every step, so `link` must not turn into
+     * `link.link` when the node path already ends with the selected field.
+     */
+    // 作用：拼接字段路径；逻辑：先消去尾部与待追加前缀的重叠，再追加剩余部分。
+    private static void appendFields(List<String> path, List<String> fields) {
+        if (fields == null || fields.isEmpty()) {
+            return;
+        }
+        int overlap = 0;
+        for (int size = Math.min(path.size(), fields.size()); size > 0; size--) {
+            if (path.subList(path.size() - size, path.size())
+                    .equals(fields.subList(0, size))) {
+                overlap = size;
+                break;
+            }
+        }
+        path.addAll(fields.subList(overlap, fields.size()));
+    }
+
+    // 作用：判断字段选择是否已经由节点自身路径表达；逻辑：比较 accessPath 或 canonicalValue 的后缀。
+    private static boolean alreadyEndsWith(ValueNodeRecord node, List<String> fields) {
+        if (node == null || fields.isEmpty()) {
+            return false;
+        }
+        if (endsWith(node.accessPath(), fields)) {
+            return true;
+        }
+        String canonical = node.canonicalValue();
+        return canonical != null
+                && canonical.endsWith("." + String.join(".", fields));
+    }
+
+    // 作用：判断路径列表是否以指定字段序列结尾；逻辑：逐项比较尾部元素。
+    private static boolean endsWith(List<String> path, List<String> fields) {
+        return path != null
+                && !fields.isEmpty()
+                && path.size() >= fields.size()
+                && path.subList(path.size() - fields.size(), path.size()).equals(fields);
     }
 
     // 作用：替换引用的字段路径；逻辑：复制引用并写入新的字段列表。
@@ -1610,7 +2112,30 @@ final class LineageIndex {
         if (callSiteId == null || callSiteId.isBlank()) {
             return context;
         }
-        return context.isBlank() ? callSiteId : context + "/" + callSiteId;
+        String next = context.isBlank() ? callSiteId : context + "/" + callSiteId;
+        /*
+         * frames <= length + 1, so a context shorter than the frame limit can
+         * never need trimming. Deep cones push this millions of times and the
+         * character scan showed up as a hot spot in pathological traces.
+         */
+        if (next.length() < MAX_CALL_CONTEXT_FRAMES) {
+            return next;
+        }
+        int frames = 1;
+        for (int index = 0; index < next.length(); index++) {
+            if (next.charAt(index) == '/') {
+                frames++;
+            }
+        }
+        while (frames > MAX_CALL_CONTEXT_FRAMES) {
+            int separator = next.indexOf('/');
+            if (separator < 0) {
+                break;
+            }
+            next = next.substring(separator + 1);
+            frames--;
+        }
+        return next;
     }
 
     // 作用：弹出调用上下文；逻辑：移除最近的调用点标记。
@@ -1639,6 +2164,85 @@ final class LineageIndex {
     // 作用：判断字段节点是否存在；逻辑：查字段节点键集合。
     boolean hasFieldNode(String scopeId, String rootName, List<String> accessPath) {
         return fieldNodeKeys.contains(fieldNodeKey(scopeId, rootName, accessPath));
+    }
+
+    // 作用：判断字段是否有更深的已证字段；逻辑：检查预计算的字段前缀集合。
+    boolean hasFieldDescendant(ValueNodeRecord node, List<String> extraFields) {
+        if (node == null) {
+            return false;
+        }
+        String rootName = node.rootName() == null || node.rootName().isBlank()
+                ? node.canonicalValue()
+                : node.rootName();
+        List<String> path = joinFields(
+                node.accessPath() == null ? List.of() : node.accessPath(),
+                extraFields
+        );
+        return rootName != null
+                && !path.isEmpty()
+                && fieldPathsWithDescendants.contains(fieldNodeKey(
+                node.scopeSymbolId(), rootName, path));
+    }
+
+    // 作用：判断字段是否存在依赖消费；逻辑：检查条件/调用输入等依赖边登记过的字段路径。
+    boolean hasDependencyUse(ValueNodeRecord node, List<String> extraFields) {
+        if (node == null) {
+            return false;
+        }
+        if ((extraFields == null || extraFields.isEmpty())
+                && dependencySourceNodeIds.contains(node.valueId())) {
+            /*
+             * Locals and whole expressions are not field paths, but a value
+             * consumed only by a condition is still consumed. Without this the
+             * trace reports NO_CONSUMER for a local that the very next branch
+             * depends on.
+             */
+            return true;
+        }
+        String rootName = node.rootName() == null || node.rootName().isBlank()
+                ? node.canonicalValue()
+                : node.rootName();
+        List<String> path = joinFields(
+                node.accessPath() == null ? List.of() : node.accessPath(),
+                extraFields
+        );
+        return rootName != null
+                && !path.isEmpty()
+                && dependencyFieldPaths.contains(fieldNodeKey(
+                node.scopeSymbolId(), rootName, path));
+    }
+
+    // 作用：判断对象根是否有字段证据；逻辑：查预计算的字段根集合。
+    boolean hasFieldEvidence(ValueNodeRecord node) {
+        if (node == null) {
+            return false;
+        }
+        String rootName = node.rootName() == null || node.rootName().isBlank()
+                ? node.canonicalValue()
+                : node.rootName();
+        return rootName != null
+                && fieldRootsWithEvidence.contains(fieldNodeKey(
+                node.scopeSymbolId(), rootName, List.of()));
+    }
+
+    // 作用：登记依赖边来源字段；逻辑：仅记录带根名与访问路径的具体字段节点。
+    private void registerDependencyField(String valueId) {
+        ValueNodeRecord node = nodesById.get(valueId);
+        if (node == null || node.rootName() == null || isEmpty(node.accessPath())) {
+            return;
+        }
+        dependencyFieldPaths.add(fieldNodeKey(
+                node.scopeSymbolId(), node.rootName(), node.accessPath()));
+    }
+
+    // 作用：合并节点自身路径与引用追加路径；逻辑：空追加时复用原路径。
+    private List<String> joinFields(List<String> accessPath, List<String> extraFields) {
+        if (extraFields == null || extraFields.isEmpty()) {
+            return accessPath;
+        }
+        List<String> path = new ArrayList<>(accessPath);
+        path.addAll(extraFields);
+        return List.copyOf(path);
     }
 
     // 作用：生成字段节点键；逻辑：拼接作用域、根名与访问路径。

@@ -54,6 +54,10 @@ public final class ExpressionTypeResolver {
             return resolveType(value, cast.getType().asString());
         }
         if (value instanceof NameExpr name) {
+            String declaredType = context.declaredType(name);
+            if (declaredType != null && !declaredType.isBlank()) {
+                return resolveType(value, declaredType);
+            }
             return resolveType(value, name.getNameAsString());
         }
         if (value instanceof FieldAccessExpr field) {
@@ -141,7 +145,7 @@ public final class ExpressionTypeResolver {
             return cast.getType().asString();
         }
         if (value instanceof NameExpr name) {
-            return context.declaredType(name.getNameAsString());
+            return context.declaredType(name);
         }
         if (value instanceof FieldAccessExpr field) {
             String owner = resolveTypeExpression(field.getScope(), scope, context);

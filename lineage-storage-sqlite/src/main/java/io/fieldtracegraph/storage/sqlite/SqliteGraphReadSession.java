@@ -41,23 +41,63 @@ public final class SqliteGraphReadSession implements GraphReadSession {
     private final EdgeEvidenceDao edgeEvidenceDao;
     private final MethodSummaryDao methodSummaryDao;
     private final ValueGraphDao valueGraphDao;
+    private final String databasePath;
+    private Integer cachedGeneration;
+    private volatile long deadlineNanos;
     private boolean closed;
 
     // 作用：创建只读查询会话；逻辑：保存连接并为各数据表初始化对应 DAO。
     public SqliteGraphReadSession(Connection connection) {
+        this(connection, null);
+    }
+
+    // 作用：创建带库路径的只读会话；逻辑：库路径用于跨用例复用整代调用图缓存。
+    public SqliteGraphReadSession(Connection connection, String databasePath) {
         this.connection = connection;
+        this.databasePath = databasePath;
         this.sourceFileDao = new SourceFileDao(connection);
         this.symbolDao = new SymbolDao(connection);
         this.callEdgeDao = new CallEdgeDao(connection);
         this.edgeEvidenceDao = new EdgeEvidenceDao(connection);
         this.methodSummaryDao = new MethodSummaryDao(connection);
         this.valueGraphDao = new ValueGraphDao(connection);
+        installDeadlineHandler();
+    }
+
+    /**
+     * sqlite-jdbc exposes a VM-step callback that can abort the running
+     * statement. Without it a single query over a very wide call cone ignores
+     * the traversal budget and can block for minutes.
+     */
+    // 作用：安装查询截止回调；逻辑：每两万次 VM 步检查一次预算，超时返回非零值中断语句。
+    private void installDeadlineHandler() {
+        try {
+            org.sqlite.ProgressHandler.setHandler(connection, 20_000, new org.sqlite.ProgressHandler() {
+                @Override
+                protected int progress() {
+                    long deadline = deadlineNanos;
+                    return deadline > 0 && System.nanoTime() > deadline ? 1 : 0;
+                }
+            });
+        } catch (SQLException ignored) {
+            // Non-SQLite connections or older drivers simply keep phase-level checks.
+        }
+    }
+
+    // 作用：设置查询硬截止时间；逻辑：供查询服务在打开会话后传入本次预算。
+    @Override
+    public void setDeadlineNanos(long deadlineNanos) {
+        this.deadlineNanos = deadlineNanos;
     }
 
     // 作用：读取当前索引代数；逻辑：从索引状态单例行取 active_generation，缺失时返回 0。
     @Override
     public int generation() {
-        return scalarInt("SELECT active_generation FROM full_index_state WHERE singleton_id = 1", 0);
+        if (cachedGeneration == null) {
+            cachedGeneration = scalarInt(
+                    "SELECT active_generation FROM full_index_state WHERE singleton_id = 1", 0);
+        }
+        return cachedGeneration;
     }
 
     // 作用：读取图状态；逻辑：从索引状态单例行取 graph_status，缺失时返回 EMPTY。
@@ -126,6 +166,12 @@ public final class SqliteGraphReadSession implements GraphReadSession {
         return edgeEvidenceDao.forScopeIds(scopeIds);
     }
 
+    // 作用：按已加载边引用加载证据；逻辑：委托证据 DAO 分批按 ID 查询。
+    @Override
+    public List<EdgeEvidence> edgeEvidenceForEdgeRefs(List<String> evidenceIds, List<String> sourceEdgeIds) {
+        return edgeEvidenceDao.forEdgeRefs(evidenceIds, sourceEdgeIds, deadlineNanos);
+    }
+
     // 作用：加载调用边；逻辑：合并已解析边与由未解析引用投影出的调用边。
     @Override
     public List<CallEdgeRecord> callEdgesForScopeIds(List<String> callerSymbolIds) {
@@ -187,13 +233,14 @@ public final class SqliteGraphReadSession implements GraphReadSession {
     // 作用：构建被调方到调用方映射；逻辑：委托调用边 DAO 聚合调用关系。
     @Override
     public Map<String, Set<String>> callersByCallee() {
-        return callEdgeDao.callersByCallee();
+        return CallGraphCache.callers(databasePath, generation(), callEdgeDao::callersByCallee);
     }
 
     // 作用：构建引用名到调用方映射；逻辑：委托调用边 DAO 聚合未解析引用。
     @Override
     public Map<String, Set<String>> pendingRefCallersByReferenceName() {
-        return callEdgeDao.pendingRefCallersByReferenceName();
+        return CallGraphCache.pendingRefsByReferenceName(
+                databasePath, generation(), callEdgeDao::pendingRefCallersByReferenceName);
     }
 
     // 作用：由路径查全限定名；逻辑：委托符号 DAO 按相对路径集合查询。

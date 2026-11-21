@@ -178,6 +178,14 @@ record Step(
                 callSiteId, callContextDirection, argIndex, provenance, evidence);
     }
 
+    // 作用：复制遍历步并替换副作用位置；逻辑：保留其余字段，只更新 effectLocation。
+    Step withEffectLocation(String newEffectLocation) {
+        return new Step(source, target, edgeType, operation, resolution, evidenceId, fileId,
+                lineStart, columnStart, lineEnd, columnEnd,
+                newEffectLocation == null ? "" : newEffectLocation, propagateFields,
+                callSiteId, callContextDirection, argIndex, provenance, evidence);
+    }
+
     /**
      * Same evidence, opposite endpoints. Used when a backward traversal
      * projects an object root onto one of its selected fields.

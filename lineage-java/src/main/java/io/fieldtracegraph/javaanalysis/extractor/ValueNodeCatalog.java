@@ -71,6 +71,114 @@ public final class ValueNodeCatalog {
         return created;
     }
 
+    /**
+     * Creates one return node per {@code return} statement. Display identity
+     * stays {@code RETURN} so callers and field projections keep working, but
+     * the stable key and declaration position stay bound to that statement.
+     * Without this, every return in a method shared one node and the evidence
+     * for {@code RETURN.<field>} could land on a different return line.
+     */
+    // 作用：为单个 return 语句创建独立版本节点；逻辑：键区分语句，显示值仍为 RETURN。
+    public ValueNodeRecord ensureReturn(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            String key,
+            Node anchor
+    ) {
+        ValueNodeRecord existing = nodes.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        int line = anchor.getBegin().map(position -> position.line).orElse(1);
+        int column = anchor.getBegin().map(position -> position.column).orElse(1);
+        int endLine = anchor.getEnd().map(position -> position.line).orElse(line);
+        int endColumn = anchor.getEnd().map(position -> position.column).orElse(column);
+        ValueNodeRecord created = new ValueNodeRecord(
+                Ids.sha256(scope.symbolId(), key, "logical-return"),
+                scope.symbolId(),
+                source.fileId(),
+                "RETURN",
+                "RETURN",
+                "RETURN",
+                List.of(),
+                line * 10_000 + column,
+                0,
+                null,
+                line,
+                column,
+                endLine,
+                endColumn,
+                source.relativePath(),
+                line,
+                column,
+                endLine,
+                endColumn
+        );
+        nodes.put(key, created);
+        accumulator.addValueNode(created);
+        return created;
+    }
+
+    // 作用：生成 return 版本键；逻辑：用 return 语句起始行列保证同一方法内唯一且稳定。
+    public static String returnKey(Node returnStatement) {
+        int line = returnStatement.getBegin().map(position -> position.line).orElse(1);
+        int column = returnStatement.getBegin().map(position -> position.column).orElse(1);
+        return "return@" + line + ":" + column;
+    }
+
+    /**
+     * Creates a field node whose stable key may differ from its user-facing
+     * root. Framework factories need this because many calls named
+     * {@code Pair.of(2)} share the same display root but must keep independent
+     * field evidence and declaration positions.
+     */
+    // 作用：按显式根名创建字段节点；逻辑：键去重，但值身份与根路径按调用点保持独立。
+    public ValueNodeRecord ensureField(
+            SourceFileRecord source,
+            CallableScope scope,
+            Map<String, ValueNodeRecord> nodes,
+            JavaAnalysisAccumulator accumulator,
+            String key,
+            String rootName,
+            String accessPath,
+            String kind,
+            Node anchor
+    ) {
+        ValueNodeRecord existing = nodes.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        String canonical = rootName + "." + accessPath;
+        int line = anchor.getBegin().map(position -> position.line).orElse(1);
+        int column = anchor.getBegin().map(position -> position.column).orElse(1);
+        ValueNodeRecord created = new ValueNodeRecord(
+                Ids.sha256(scope.symbolId(), key, "logical-field"),
+                scope.symbolId(),
+                source.fileId(),
+                kind,
+                canonical,
+                rootName,
+                List.of(accessPath.split("\\.")),
+                line * 10_000 + column,
+                0,
+                null,
+                line,
+                column,
+                anchor.getEnd().map(position -> position.line).orElse(line),
+                anchor.getEnd().map(position -> position.column).orElse(column),
+                source.relativePath(),
+                line,
+                column,
+                anchor.getEnd().map(position -> position.line).orElse(line),
+                anchor.getEnd().map(position -> position.column).orElse(column)
+        );
+        nodes.put(key, created);
+        accumulator.addValueNode(created);
+        return created;
+    }
+
     // 作用：规范化节点键；逻辑：字段写入键去掉前缀，其余键原样返回。
     public String canonical(String key) {
         if (key == null) {

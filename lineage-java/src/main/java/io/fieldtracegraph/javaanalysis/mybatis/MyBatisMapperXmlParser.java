@@ -89,9 +89,20 @@ public final class MyBatisMapperXmlParser {
                     new ByteArrayInputStream(source.getBytes(StandardCharsets.UTF_8))
             );
             Element mapper = document.getDocumentElement();
-            if (mapper == null
-                    || (!"mapper".equals(mapper.getTagName())
-                    && !"sqlMap".equals(mapper.getTagName()))) {
+            if (mapper == null) {
+                return null;
+            }
+            /*
+             * {@code sqlmap-config.xml} is an iBatis configuration document
+             * (datasources + mapper resources), not a statement file. Warning
+             * about it made every iBatis project report a false
+             * MYBATIS_MAPPER_INVALID diagnostic.
+             */
+            if ("sqlMapConfig".equals(mapper.getTagName())) {
+                return null;
+            }
+            if (!"mapper".equals(mapper.getTagName())
+                    && !"sqlMap".equals(mapper.getTagName())) {
                 diagnostics.accept(new Diagnostic(
                         "MYBATIS_MAPPER_INVALID",
                         "Mapper XML root element must be <mapper> or <sqlMap>",

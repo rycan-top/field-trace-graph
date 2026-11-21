@@ -23,6 +23,9 @@ public final class SqliteGraphSnapshotReader implements GraphSnapshotReader {
     // 作用：打开只读图快照；逻辑：以只读模式建连并包装为查询会话。
     @Override
     public GraphReadSession open(Path databasePath) {
-        return new SqliteGraphReadSession(dataSourceFactory.open(databasePath, true));
+        return new SqliteGraphReadSession(
+                dataSourceFactory.open(databasePath, true),
+                databasePath.toAbsolutePath().normalize().toString()
+        );
     }
 }
